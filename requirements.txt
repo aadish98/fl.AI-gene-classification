@@ -1,0 +1,8 @@
+requests
+pydantic
+pandas
+python-dotenv
+PyPDF2
+metapub
+openai
+openpyxl

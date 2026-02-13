@@ -1,0 +1,50 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+.venv-py310/
+venv/
+env/
+ENV/
+
+# Environment and local config
+.env
+.env.*
+*.local
+
+# Logs and runtime output
+Logs/
+logs/
+*.log
+*.out
+*.err
+*.pid
+
+# Data, results, and pipeline state
+Data/
+data/
+outputs/
+output/
+results/
+artifacts/
+.batch_state/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
