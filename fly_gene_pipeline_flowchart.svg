@@ -1,78 +1,82 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1750" viewBox="0 0 1400 1750">
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="2820" viewBox="0 0 1800 2820">
   <defs>
     <style>
-      .title { font: 700 52px Arial, sans-serif; fill: #0f172a; }
-      .step { fill: #eef6ff; stroke: #2563eb; stroke-width: 2.5; rx: 16; }
-      .steptext { font: 600 31px Arial, sans-serif; fill: #0f172a; }
-      .subtext { font: 400 25px Arial, sans-serif; fill: #334155; }
-      .note { fill: #f8fafc; stroke: #64748b; stroke-width: 2; stroke-dasharray: 8 6; rx: 12; }
-      .notetext { font: 600 20px Arial, sans-serif; fill: #334155; }
-      .arrow { stroke: #2563eb; stroke-width: 4; fill: none; marker-end: url(#arrowhead); }
+      .title { font: 700 68px Arial, sans-serif; fill: #0f172a; }
+      .step { fill: #eef6ff; stroke: #2563eb; stroke-width: 3; rx: 18; }
+      .steptext { font: 700 40px Arial, sans-serif; fill: #0f172a; }
+      .subtext { font: 500 30px Arial, sans-serif; fill: #334155; }
+      .arrow { stroke: #2563eb; stroke-width: 5; fill: none; marker-end: url(#arrowhead); }
     </style>
-    <marker id="arrowhead" markerWidth="12" markerHeight="12" refX="8" refY="4" orient="auto">
-      <polygon points="0,0 8,4 0,8" fill="#2563eb" />
+    <marker id="arrowhead" markerWidth="14" markerHeight="14" refX="10" refY="5" orient="auto">
+      <polygon points="0,0 10,5 0,10" fill="#2563eb" />
     </marker>
   </defs>
 
-  <text x="700" y="70" text-anchor="middle" class="title">Fly Gene Classification Pipeline</text>
+  <text x="900" y="100" text-anchor="middle" class="title">Fly Gene Classification Pipeline</text>
 
-  <rect x="160" y="120" width="1080" height="105" class="step" />
-  <text x="700" y="165" text-anchor="middle" class="steptext">1) Read input directory with CSV files</text>
-  <text x="700" y="195" text-anchor="middle" class="subtext">Each file must contain gene symbols in the configured input column</text>
+  <rect x="130" y="160" width="1540" height="190" class="step" />
+  <text x="900" y="238" text-anchor="middle" class="steptext">1) Read input directory with CSV files</text>
+  <text x="900" y="300" text-anchor="middle" class="subtext">Each file must include gene symbols in the configured input column</text>
 
-  <path d="M700 225 L700 260" class="arrow" />
+  <path d="M900 350 L900 410" class="arrow" />
 
-  <rect x="160" y="260" width="1080" height="105" class="step" />
-  <text x="700" y="305" text-anchor="middle" class="steptext">2) Convert symbols to FBgn IDs</text>
-  <text x="700" y="335" text-anchor="middle" class="subtext">Runs HelperScripts/GetFBgnIDs.py before classification</text>
+  <rect x="130" y="410" width="1540" height="190" class="step" />
+  <text x="900" y="488" text-anchor="middle" class="steptext">2) Convert symbols to FBgn IDs</text>
+  <text x="900" y="550" text-anchor="middle" class="subtext">Runs HelperScripts/GetFBgnIDs.py before classification</text>
 
-  <path d="M700 365 L700 400" class="arrow" />
+  <path d="M900 600 L900 660" class="arrow" />
 
-  <rect x="160" y="400" width="1080" height="115" class="step" />
-  <text x="700" y="445" text-anchor="middle" class="steptext">3) For each CSV: extract valid FBgn IDs and split into batches (size = 50)</text>
-  <text x="700" y="477" text-anchor="middle" class="subtext">State stored under .batch_state for resume support</text>
+  <rect x="130" y="660" width="1540" height="220" class="step" />
+  <text x="900" y="738" text-anchor="middle" class="steptext">3) Per CSV: extract valid FBgn IDs</text>
+  <text x="900" y="796" text-anchor="middle" class="steptext">and split into batches (size = 50)</text>
+  <text x="900" y="848" text-anchor="middle" class="subtext">State is saved under .batch_state for resume support</text>
 
-  <path d="M700 515 L700 550" class="arrow" />
+  <path d="M900 880 L900 940" class="arrow" />
 
-  <rect x="160" y="550" width="1080" height="120" class="step" />
-  <text x="700" y="595" text-anchor="middle" class="steptext">4) Per batch: reuse prior gene results from run_store when possible</text>
-  <text x="700" y="627" text-anchor="middle" class="subtext">Only uncached genes are newly processed; processed + reused records are merged</text>
+  <rect x="130" y="940" width="1540" height="220" class="step" />
+  <text x="900" y="1018" text-anchor="middle" class="steptext">4) Per batch: reuse prior gene results from run_store</text>
+  <text x="900" y="1076" text-anchor="middle" class="steptext">when available; process only uncached genes</text>
+  <text x="900" y="1128" text-anchor="middle" class="subtext">Processed and reused records are merged for output</text>
 
-  <path d="M700 670 L700 705" class="arrow" />
+  <path d="M900 1160 L900 1220" class="arrow" />
 
-  <rect x="160" y="705" width="1080" height="120" class="step" />
-  <text x="700" y="750" text-anchor="middle" class="steptext">5) For each gene: collect candidate references from 3 sources</text>
-  <text x="700" y="782" text-anchor="middle" class="subtext">FlyBase precomputed tables + PubMed search + Europe PMC search</text>
+  <rect x="130" y="1220" width="1540" height="220" class="step" />
+  <text x="900" y="1298" text-anchor="middle" class="steptext">5) For each gene: collect candidate references</text>
+  <text x="900" y="1356" text-anchor="middle" class="steptext">from FlyBase, PubMed, and Europe PMC</text>
+  <text x="900" y="1408" text-anchor="middle" class="subtext">Build one combined candidate reference set per gene</text>
 
-  <path d="M700 825 L700 860" class="arrow" />
+  <path d="M900 1440 L900 1500" class="arrow" />
 
-  <rect x="160" y="860" width="1080" height="120" class="step" />
-  <text x="700" y="905" text-anchor="middle" class="steptext">6) Merge/deduplicate PMCIDs, rank by source consensus + recency, cap by --reference-limit</text>
-  <text x="700" y="937" text-anchor="middle" class="subtext">Consensus across sources is prioritized before year/PMCID recency</text>
+  <rect x="130" y="1500" width="1540" height="220" class="step" />
+  <text x="900" y="1578" text-anchor="middle" class="steptext">6) Merge + deduplicate PMCIDs, then rank references</text>
+  <text x="900" y="1636" text-anchor="middle" class="steptext">by source consensus and recency</text>
+  <text x="900" y="1688" text-anchor="middle" class="subtext">Apply --reference-limit after ranking</text>
 
-  <path d="M700 980 L700 1015" class="arrow" />
+  <path d="M900 1720 L900 1780" class="arrow" />
 
-  <rect x="160" y="1015" width="1080" height="120" class="step" />
-  <text x="700" y="1060" text-anchor="middle" class="steptext">7) Resolve metadata and apply keyword filter on title/abstract</text>
-  <text x="700" y="1092" text-anchor="middle" class="subtext">Only keyword-matching references continue to full-text/summarization stage</text>
+  <rect x="130" y="1780" width="1540" height="220" class="step" />
+  <text x="900" y="1858" text-anchor="middle" class="steptext">7) Resolve metadata and filter references</text>
+  <text x="900" y="1916" text-anchor="middle" class="steptext">by keyword matches in title/abstract</text>
+  <text x="900" y="1968" text-anchor="middle" class="subtext">Only matching references continue to summarization</text>
 
-  <path d="M700 1135 L700 1170" class="arrow" />
+  <path d="M900 2000 L900 2060" class="arrow" />
 
-  <rect x="160" y="1170" width="1080" height="140" class="step" />
-  <text x="700" y="1215" text-anchor="middle" class="steptext">8) Per passing reference: fetch full text (or fallback), summarize, run QC</text>
-  <text x="700" y="1247" text-anchor="middle" class="subtext">Keep high-quality summaries (up to 6 per gene, max 50 attempts)</text>
-  <text x="700" y="1278" text-anchor="middle" class="subtext">QC drops outputs with "No evidence found" / "skip reference"</text>
+  <rect x="130" y="2060" width="1540" height="260" class="step" />
+  <text x="900" y="2138" text-anchor="middle" class="steptext">8) Per passing reference: fetch full text (or fallback),</text>
+  <text x="900" y="2196" text-anchor="middle" class="steptext">summarize evidence, and run QC checks</text>
+  <text x="900" y="2250" text-anchor="middle" class="subtext">Keep high-quality summaries (up to 6 per gene; max 50 attempts)</text>
+  <text x="900" y="2296" text-anchor="middle" class="subtext">Drop outputs such as "No evidence found" or "skip reference"</text>
 
-  <path d="M700 1310 L700 1345" class="arrow" />
+  <path d="M900 2320 L900 2380" class="arrow" />
 
-  <rect x="160" y="1345" width="1080" height="120" class="step" />
-  <text x="700" y="1390" text-anchor="middle" class="steptext">9) Aggregate accepted summaries and classify gene into keyword categories</text>
-  <text x="700" y="1422" text-anchor="middle" class="subtext">Outputs category list, confidence score, and rationale</text>
+  <rect x="130" y="2380" width="1540" height="220" class="step" />
+  <text x="900" y="2458" text-anchor="middle" class="steptext">9) Aggregate accepted summaries and classify genes</text>
+  <text x="900" y="2516" text-anchor="middle" class="steptext">into keyword categories</text>
+  <text x="900" y="2568" text-anchor="middle" class="subtext">Output category list, confidence score, and rationale</text>
 
-  <path d="M700 1465 L700 1500" class="arrow" />
+  <path d="M900 2600 L900 2660" class="arrow" />
 
-  <rect x="160" y="1500" width="1080" height="140" class="step" />
-  <text x="700" y="1545" text-anchor="middle" class="steptext">10) Export &amp; persist artifacts</text>
-  <text x="700" y="1577" text-anchor="middle" class="subtext">Write &lt;input&gt;_classification.xlsx (Gene Set, Classification, Reference Summaries)</text>
-  <text x="700" y="1608" text-anchor="middle" class="subtext">Save run-store, batch state, and metadata/full-text caches for future runs</text>
+  <rect x="130" y="2660" width="1540" height="160" class="step" />
+  <text x="900" y="2730" text-anchor="middle" class="steptext">10) Export &amp; persist artifacts</text>
+  <text x="900" y="2780" text-anchor="middle" class="subtext">Write &lt;input&gt;_classification.xlsx and save run/cache state</text>
 </svg>
