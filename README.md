@@ -4,7 +4,7 @@ Standalone Fly Gene Classification pipeline that converts input gene symbols to 
 
 ## Pipeline Flowchart
 
-![Fly Gene Classification Pipeline](fly_gene_pipeline_high_level_flowchart.png)
+![Fly Gene Classification Pipeline](fly_gene_pipeline_flowchart.svg)
 
 ## High-Level Flow (8 bullets)
 
