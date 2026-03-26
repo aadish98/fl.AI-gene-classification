@@ -24,7 +24,7 @@ import io
 import subprocess
 import json
 import hashlib
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import pandas as pd
 from collections import defaultdict
@@ -68,6 +68,9 @@ GET_FBGN_IDS_SCRIPT = Path(__file__).parent / "HelperScripts" / "GetFBgnIDs.py"
 BATCH_SIZE = 50
 BATCH_STATE_DIRNAME = ".batch_state"
 RUN_STORE_FILENAME = "run_store.json"
+MAX_PROMPT_WORDS = 5000
+SHARED_PROMPT_OVERHEAD_WORDS = 800
+MIN_CHUNK_WORDS = 750
 
 
 ###############################################################################
@@ -1317,15 +1320,462 @@ def fetch_full_text_by_id(identifier, id_type="pmcid", doi=None, pmid=None):
 # Summarization
 ###############################################################################
 
-def _truncate_text(text, max_chars=200000):
-    """Truncate text while keeping head and tail."""
-    if not text:
+class FunctionPhenotypeSummary(BaseModel):
+    function: str = ""
+    phenotypes: str = ""
+    skip_reference: bool = False
+    skip_reason: str = ""
+
+
+class FinalFunctionPhenotypeSummary(BaseModel):
+    function: str = ""
+    phenotypes: str = ""
+
+
+class ReferenceReagent(BaseModel):
+    stock_id: str = ""
+    collection: str = ""
+    reagent_type: str = ""
+    evidence_snippet: str = ""
+    functional_validity: str = ""
+    reagent_name: str = ""
+
+
+class ReagentExtraction(BaseModel):
+    reagents: List[ReferenceReagent] = Field(default_factory=list)
+
+
+def _count_words(text: str) -> int:
+    """Approximate word count using whitespace-delimited tokens."""
+    return len(re.findall(r"\S+", str(text or "")))
+
+
+def _clean_text(value: Any) -> str:
+    """Collapse repeated whitespace and coerce to string."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    """Remove duplicate strings while preserving original order."""
+    seen = set()
+    out = []
+    for value in values or []:
+        cleaned = _clean_text(value)
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned)
+    return out
+
+
+def _join_unique_texts(values: list[str], separator: str = "; ") -> str:
+    """Join deduplicated text fragments with a stable separator."""
+    return separator.join(_dedupe_preserve_order(values))
+
+
+def _chunk_text_by_word_budget(text: str, max_words: int) -> list[str]:
+    """Split text into deterministic chunks that stay within a word budget."""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return [""]
+
+    paragraphs = [
+        _clean_text(chunk)
+        for chunk in re.split(r"\n\s*\n+", cleaned)
+        if _clean_text(chunk)
+    ]
+    if not paragraphs:
+        paragraphs = [_clean_text(cleaned)]
+
+    max_words = max(int(max_words or 0), MIN_CHUNK_WORDS)
+    chunks: list[str] = []
+    current_parts: list[str] = []
+    current_words = 0
+
+    for paragraph in paragraphs:
+        paragraph_words = _count_words(paragraph)
+        if paragraph_words > max_words:
+            if current_parts:
+                chunks.append("\n\n".join(current_parts))
+                current_parts = []
+                current_words = 0
+
+            words = paragraph.split()
+            for idx in range(0, len(words), max_words):
+                chunk_words = words[idx: idx + max_words]
+                if chunk_words:
+                    chunks.append(" ".join(chunk_words))
+            continue
+
+        if current_parts and current_words + paragraph_words > max_words:
+            chunks.append("\n\n".join(current_parts))
+            current_parts = [paragraph]
+            current_words = paragraph_words
+            continue
+
+        current_parts.append(paragraph)
+        current_words += paragraph_words
+
+    if current_parts:
+        chunks.append("\n\n".join(current_parts))
+
+    return chunks or [cleaned]
+
+
+def _build_shared_prompt_chunks(
+    full_text: str,
+    gene_symbol: str,
+    fbgn_id: str,
+    synonyms: list[str],
+    title: str = "",
+    abstract: str = "",
+) -> list[str]:
+    """Create deterministic chunks sized to fit within the shared prompt budget."""
+    cleaned_full_text = str(full_text or "").strip()
+    if not cleaned_full_text:
+        return [""]
+
+    metadata_blob = " ".join([
+        str(gene_symbol or ""),
+        str(fbgn_id or ""),
+        " ".join(sorted(set(synonyms or []))),
+        str(title or ""),
+        str(abstract or ""),
+    ])
+    overhead_words = _count_words(metadata_blob) + SHARED_PROMPT_OVERHEAD_WORDS
+    chunk_word_budget = max(MIN_CHUNK_WORDS, MAX_PROMPT_WORDS - overhead_words)
+
+    if _count_words(cleaned_full_text) <= chunk_word_budget:
+        return [cleaned_full_text]
+    return _chunk_text_by_word_budget(cleaned_full_text, chunk_word_budget)
+
+
+def _model_dump(value: Any) -> dict[str, Any]:
+    """Return a plain dict for a parsed Pydantic model."""
+    if value is None:
+        return {}
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+def _parse_structured_completion(
+    messages: list[dict[str, str]],
+    response_format,
+    model_name: Optional[str] = None,
+    max_completion_tokens: int = 1500,
+):
+    """Call the OpenAI structured-output API with light retries."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            completion = client.beta.chat.completions.parse(
+                model=(model_name or os.getenv("OPENAI_MODEL") or "gpt-5-nano"),
+                messages=messages,
+                response_format=response_format,
+                max_completion_tokens=max_completion_tokens,
+            )
+            parsed = completion.choices[0].message.parsed
+            if parsed is not None:
+                return parsed
+            raise ValueError("Empty parsed response from API")
+        except Exception as e:
+            last_err = e
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(str(last_err))
+
+
+def summarize_reference_function(
+    text_chunk: str,
+    gene_symbol: str,
+    fbgn_id: str,
+    synonyms: list[str],
+    model_name: Optional[str] = None,
+    title: str = "",
+    abstract: str = "",
+    chunk_index: int = 1,
+    total_chunks: int = 1,
+) -> dict[str, Any]:
+    """Extract function and phenotype evidence for one chunk of a paper."""
+    synonyms_str = ", ".join(sorted(set(synonyms))) if synonyms else ""
+    sys = (
+        "You are an expert biomedical assistant. Use ONLY the provided title, abstract, "
+        "and text chunk. Focus only on the target gene. If the chunk contains no direct "
+        "evidence about the target gene, set skip_reference to true."
+    )
+    user = f"""Assess evidence for gene {gene_symbol} (FBgn: {fbgn_id}; Synonyms: {synonyms_str}).
+
+Return JSON with fields:
+- function: concise summary of gene {gene_symbol} function evidence from this chunk only
+- phenotypes: concise summary of phenotype evidence of gene {gene_symbol} from this chunk only
+- skip_reference: true if this chunk does not contain direct evidence for {gene_symbol}
+- skip_reason: brief reason when skip_reference is true
+
+Rules:
+- Always name {gene_symbol} explicitly
+- Be factual and use only the provided text
+- If evidence is generic or unrelated to {gene_symbol}, set skip_reference to true
+- If one field is absent but the chunk still contains evidence, return an empty string for that field
+
+Title: {title or ''}
+Abstract: {abstract or ''}
+
+Text chunk:
+{text_chunk or ''}"""
+    try:
+        out = _parse_structured_completion(
+            [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            response_format=FunctionPhenotypeSummary,
+            model_name=model_name,
+            max_completion_tokens=1200,
+        )
+        parsed = _model_dump(out)
+        function_text = _clean_text(parsed.get("function", ""))
+        phenotype_text = _clean_text(parsed.get("phenotypes", ""))
+        skip_reference = bool(parsed.get("skip_reference", False))
+        skip_reason = _clean_text(parsed.get("skip_reason", ""))
+        if not skip_reference and not function_text and not phenotype_text:
+            skip_reference = True
+            skip_reason = skip_reason or "No function or phenotype evidence returned"
+        return {
+            "function": function_text,
+            "phenotypes": phenotype_text,
+            "skip_reference": skip_reference,
+            "skip_reason": skip_reason,
+        }
+    except Exception as e:
+        return {
+            "function": "",
+            "phenotypes": "",
+            "skip_reference": True,
+            "skip_reason": f"API error: {e}",
+        }
+
+
+def rewrite_function_summary(
+    gene_symbol: str,
+    fbgn_id: str,
+    chunk_summaries: list[dict[str, Any]],
+    model_name: Optional[str] = None,
+) -> dict[str, str]:
+    """Rewrite multiple chunk-level summaries into one cohesive paper summary."""
+    chunk_lines = []
+    for idx, chunk_summary in enumerate(chunk_summaries or [], start=1):
+        function_text = _clean_text(chunk_summary.get("function", ""))
+        phenotype_text = _clean_text(chunk_summary.get("phenotypes", ""))
+        chunk_lines.append(
+            f"Chunk {idx}\n"
+            f"Function: {function_text or 'None'}\n"
+            f"Phenotypes: {phenotype_text or 'None'}"
+        )
+    merged_input = "\n\n".join(chunk_lines)
+
+    fallback = {
+        "function": _join_unique_texts([summary.get("function", "") for summary in chunk_summaries]),
+        "phenotypes": _join_unique_texts([summary.get("phenotypes", "") for summary in chunk_summaries]),
+    }
+
+    sys = (
+        "You are an expert biomedical assistant. Merge chunk-level evidence summaries into a "
+        "single cohesive paper-level summary. Use ONLY the provided chunk summaries."
+    )
+    user = f"""Rewrite these chunk-level summaries for gene {gene_symbol} (FBgn: {fbgn_id}) into one cohesive paper summary.
+
+Return JSON with fields:
+- function
+- phenotypes
+
+Rules:
+- Always name {gene_symbol} explicitly
+- Preserve factual content only
+- Remove redundancy across chunks
+- Do not introduce new claims
+
+Chunk summaries:
+{merged_input}"""
+    try:
+        out = _parse_structured_completion(
+            [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            response_format=FinalFunctionPhenotypeSummary,
+            model_name=model_name,
+            max_completion_tokens=1200,
+        )
+        parsed = _model_dump(out)
+        return {
+            "function": _clean_text(parsed.get("function", "")) or fallback["function"],
+            "phenotypes": _clean_text(parsed.get("phenotypes", "")) or fallback["phenotypes"],
+        }
+    except Exception:
+        return fallback
+
+
+def _normalize_collection_name(collection: str) -> str:
+    """Normalize collection names into stable export values."""
+    cleaned = _clean_text(collection)
+    lowered = cleaned.lower()
+    if not cleaned:
         return ""
-    if len(text) <= max_chars:
-        return text
-    head = text[: max_chars // 2]
-    tail = text[-(max_chars // 2):]
-    return f"{head}\n\n[...truncated...]\n\n{tail}"
+    if "bloomington" in lowered or "bdsc" in lowered:
+        return "BDSC"
+    if "vienna" in lowered or "vdrc" in lowered:
+        return "VDRC"
+    if "national institute of genetics" in lowered or re.search(r"\bnig\b", lowered):
+        return "NIG"
+    if "kyoto" in lowered or "dgrc" in lowered or "drosophila genetic resource center" in lowered:
+        return "Kyoto"
+    return cleaned
+
+
+def _normalize_stock_id(stock_id: str, collection: str) -> str:
+    """Normalize stock IDs to stable, dedupe-friendly forms."""
+    cleaned = _clean_text(stock_id)
+    cleaned = cleaned.replace("#", "")
+    cleaned = re.sub(r"\s+", "", cleaned)
+    if not cleaned:
+        return ""
+
+    if collection == "BDSC":
+        match = re.fullmatch(r"(?:BL|BDSC)?(\d+)", cleaned, flags=re.IGNORECASE)
+        if match:
+            return f"BL{match.group(1)}"
+    if collection == "VDRC":
+        match = re.fullmatch(r"(?:VDRC)?v?(\d+)", cleaned, flags=re.IGNORECASE)
+        if match:
+            return f"v{match.group(1)}"
+    return cleaned
+
+
+def _normalize_reagent_record(raw_reagent: Any) -> Optional[dict[str, str]]:
+    """Normalize one reagent record and enforce canonical (stock_id, collection) pairs."""
+    parsed = _model_dump(raw_reagent)
+    collection = _normalize_collection_name(parsed.get("collection", ""))
+    stock_id = _normalize_stock_id(parsed.get("stock_id", ""), collection)
+    if not stock_id or not collection:
+        return None
+    return {
+        "stock_id": stock_id,
+        "collection": collection,
+        "reagent_type": _clean_text(parsed.get("reagent_type", "")),
+        "evidence_snippet": _clean_text(parsed.get("evidence_snippet", "")),
+        "functional_validity": _clean_text(parsed.get("functional_validity", "")),
+        "reagent_name": _clean_text(parsed.get("reagent_name", "")),
+    }
+
+
+def extract_reference_reagents(
+    text_chunk: str,
+    gene_symbol: str,
+    fbgn_id: str,
+    synonyms: list[str],
+    model_name: Optional[str] = None,
+    title: str = "",
+    abstract: str = "",
+    chunk_index: int = 1,
+    total_chunks: int = 1,
+) -> list[dict[str, str]]:
+    """Extract canonical reagent pairs plus metadata from one paper chunk."""
+    synonyms_str = ", ".join(sorted(set(synonyms))) if synonyms else ""
+    sys = (
+        "You are an expert biomedical assistant. Use ONLY the provided title, abstract, "
+        "and text chunk. Extract reagent records only when they pertain to the target gene."
+    )
+    user = f"""Extract reagents for gene {gene_symbol} (FBgn: {fbgn_id}; Synonyms: {synonyms_str}).
+
+Return JSON with a single field:
+- reagents: list of objects with stock_id, collection, reagent_type, evidence_snippet, functional_validity, reagent_name
+
+Rules:
+- Only include a reagent if both stock_id and collection can be identified
+- Focus only on reagents that pertain to {gene_symbol}
+- Deduplicate exact repeats within this chunk
+- If no qualifying reagents are present, return an empty list
+- Use concise evidence_snippet text quoted or paraphrased from the chunk
+- Normalize collection names when clear, including BDSC, VDRC, NIG, and Kyoto
+
+Chunk {chunk_index} of {total_chunks}
+Title: {title or ''}
+Abstract: {abstract or ''}
+
+Text chunk:
+{text_chunk or ''}"""
+    try:
+        out = _parse_structured_completion(
+            [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            response_format=ReagentExtraction,
+            model_name=model_name,
+            max_completion_tokens=1800,
+        )
+        parsed = _model_dump(out)
+        normalized = []
+        for reagent in parsed.get("reagents", []) or []:
+            record = _normalize_reagent_record(reagent)
+            if record:
+                normalized.append(record)
+        return normalized
+    except Exception:
+        return []
+
+
+def _merge_reagent_records(base: dict[str, str], candidate: dict[str, str]) -> dict[str, str]:
+    """Merge duplicate reagent records while keeping the richest metadata."""
+    merged = dict(base or {})
+    for field in ("reagent_name", "reagent_type", "functional_validity"):
+        if not merged.get(field) and candidate.get(field):
+            merged[field] = candidate[field]
+    if len(candidate.get("evidence_snippet", "")) > len(merged.get("evidence_snippet", "")):
+        merged["evidence_snippet"] = candidate.get("evidence_snippet", "")
+    return merged
+
+
+def _merge_deduplicated_reagents(reagent_records: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Merge reagent records across chunks using the canonical pair as the key."""
+    deduped: dict[tuple[str, str], dict[str, str]] = {}
+    for record in reagent_records or []:
+        stock_id = _clean_text(record.get("stock_id", ""))
+        collection = _normalize_collection_name(record.get("collection", ""))
+        if not stock_id or not collection:
+            continue
+        key = (stock_id.lower(), collection.lower())
+        normalized_record = {
+            "stock_id": stock_id,
+            "collection": collection,
+            "reagent_type": _clean_text(record.get("reagent_type", "")),
+            "evidence_snippet": _clean_text(record.get("evidence_snippet", "")),
+            "functional_validity": _clean_text(record.get("functional_validity", "")),
+            "reagent_name": _clean_text(record.get("reagent_name", "")),
+        }
+        if key in deduped:
+            deduped[key] = _merge_reagent_records(deduped[key], normalized_record)
+        else:
+            deduped[key] = normalized_record
+    return sorted(
+        deduped.values(),
+        key=lambda item: (item.get("collection", ""), item.get("stock_id", "")),
+    )
+
+
+def _format_reagent_pairs(reagent_records: list[dict[str, str]]) -> str:
+    """Format canonical reagent pairs for sheet export."""
+    return "; ".join(
+        f"({record.get('stock_id', '')}, {record.get('collection', '')})"
+        for record in reagent_records or []
+        if record.get("stock_id") and record.get("collection")
+    )
+
+
+def _format_reference_summary(function_text: str, phenotype_text: str) -> str:
+    """Keep a compact human-readable summary for the existing summary sheet."""
+    return (
+        f"- Function: {function_text or 'None reported'}\n"
+        f"- Phenotypes: {phenotype_text or 'None reported'}"
+    )
 
 
 def gene_mentioned_in_title_abstract(title: str, abstract: str, gene_symbol: str, synonyms: list[str]) -> bool:
@@ -1348,64 +1798,6 @@ def gene_mentioned_in_title_abstract(title: str, abstract: str, gene_symbol: str
                     if re.search(rf"\b{re.escape(syn_lower)}\b", combined_text):
                         return True
     return False
-
-
-def summarize_with_openai(full_text, gene_symbol, fbgn_id, synonyms, model_name=None, title: str = "", abstract: str = ""):
-    """Summarize paper using OpenAI."""
-    text = _truncate_text(full_text, 200_000)
-    synonyms_str = ", ".join(sorted(set(synonyms))) if synonyms else ""
-    prompt = f"""Summarize this paper for gene {gene_symbol} (FBgn: {fbgn_id}; Synonyms: {synonyms_str}).
-
-Output exactly three markdown bullets:
-- Function: <summary from paper text>
-- Phenotypes: <summary from paper text>
-- Reagents: <fly stocks/lines if present; otherwise "None reported">
-
-Rules:
-- Always name {gene_symbol} explicitly (avoid pronouns like "it" or "the gene")
-- Output only the three bullets above
-- Focus only on {gene_symbol} (with synonyms {synonyms_str})
-- Be factual; prioritize full text over title/abstract
-
-CRITICAL:
-If no information is referenced for gene {gene_symbol} (synonyms {synonyms_str}) in the following publication, ignore the 3 bullets and simply return "No evidence found, skip reference".
-
-
-Title: {title or ''}
-Abstract: {abstract or ''}
-
-Full text:
-{text}""".strip()
-
-    last_err = None
-    reasoning_effort = "medium"
-    for attempt in range(3):
-        try:
-            resp = client.responses.create(
-                model=(model_name or os.getenv("OPENAI_MODEL") or "gpt-5-nano"),
-                input=prompt,
-                max_output_tokens=5000,
-                reasoning={"effort": reasoning_effort}
-            )
-            if hasattr(resp, 'status') and resp.status == 'incomplete':
-                if hasattr(resp, 'incomplete_details') and resp.incomplete_details:
-                    if hasattr(resp.incomplete_details, 'reason') and resp.incomplete_details.reason == 'max_output_tokens':
-                        if reasoning_effort != "low":
-                            reasoning_effort = "low"
-                            continue
-            
-            out = (getattr(resp, "output_text", "") or "").strip()
-            out = re.sub(
-                r"\n(?:If you[']?d like.*|Let me know.*|I can .*|Feel free.*)$",
-                "",
-                out,
-                flags=re.IGNORECASE
-            ).strip()
-            return out or str(resp)
-        except Exception as e:
-            last_err = e
-            time.sleep(1.5 * (attempt + 1))
-    return f"[ERROR: {last_err}]"
 
 
 ###############################################################################
@@ -1723,28 +2115,88 @@ def process_gene_set(fbgn_ids: list[str], keywords_list: list[str], reference_li
             if full_text and source_label != "Title+Abstract only":
                 fbgn_to_full_text_pmcids[fbgn_id].add(pmc)
             
-            summary = None
-            if full_text and source_label != "Title+Abstract only":
-                summary = summarize_with_openai(full_text, fly_symbol, fbgn_id, synonyms, title=title, abstract=abstract)
-            elif gene_mentioned_in_title_abstract(title or "", abstract or "", fly_symbol, synonyms):
-                summary = summarize_with_openai("", fly_symbol, fbgn_id, synonyms, title=title, abstract=abstract)
-            else:
+            has_title_abstract_match = gene_mentioned_in_title_abstract(
+                title or "", abstract or "", fly_symbol, synonyms
+            )
+            if not (full_text and source_label != "Title+Abstract only") and not has_title_abstract_match:
                 continue
+
+            shared_chunks = _build_shared_prompt_chunks(
+                full_text if source_label != "Title+Abstract only" else "",
+                fly_symbol,
+                fbgn_id,
+                synonyms,
+                title=title,
+                abstract=abstract,
+            )
+            total_chunks = len(shared_chunks)
+
+            function_chunk_summaries = []
+            skip_reasons = []
+            for chunk_index, text_chunk in enumerate(shared_chunks, start=1):
+                chunk_summary = summarize_reference_function(
+                    text_chunk,
+                    fly_symbol,
+                    fbgn_id,
+                    synonyms,
+                    title=title,
+                    abstract=abstract,
+                    chunk_index=chunk_index,
+                    total_chunks=total_chunks,
+                )
+                if chunk_summary.get("skip_reference", True):
+                    if chunk_summary.get("skip_reason"):
+                        skip_reasons.append(chunk_summary["skip_reason"])
+                else:
+                    function_chunk_summaries.append(chunk_summary)
             
             total_attempts += 1
-            
-            # QC check
-            summary_lower = (summary or "").lower()
-            has_skip_reference = "skip reference" in summary_lower
-            has_no_evidence = "no evidence found" in summary_lower
-            is_high_quality = not (has_skip_reference or has_no_evidence)
-            
-            if has_skip_reference:
-                qc_justification = "Contains 'skip reference'"
-            elif has_no_evidence:
-                qc_justification = "Contains 'no evidence found'"
-            else:
+
+            if function_chunk_summaries:
+                if len(function_chunk_summaries) == 1:
+                    final_function_summary = {
+                        "function": _clean_text(function_chunk_summaries[0].get("function", "")),
+                        "phenotypes": _clean_text(function_chunk_summaries[0].get("phenotypes", "")),
+                    }
+                else:
+                    final_function_summary = rewrite_function_summary(
+                        fly_symbol,
+                        fbgn_id,
+                        function_chunk_summaries,
+                    )
+
+                reagent_records = []
+                for chunk_index, text_chunk in enumerate(shared_chunks, start=1):
+                    reagent_records.extend(
+                        extract_reference_reagents(
+                            text_chunk,
+                            fly_symbol,
+                            fbgn_id,
+                            synonyms,
+                            title=title,
+                            abstract=abstract,
+                            chunk_index=chunk_index,
+                            total_chunks=total_chunks,
+                        )
+                    )
+                merged_reagents = _merge_deduplicated_reagents(reagent_records)
+                reagent_pairs_text = _format_reagent_pairs(merged_reagents)
+                summary = _format_reference_summary(
+                    final_function_summary.get("function", ""),
+                    final_function_summary.get("phenotypes", ""),
+                )
+                is_high_quality = True
                 qc_justification = "Passed QC"
+            else:
+                final_function_summary = {"function": "", "phenotypes": ""}
+                merged_reagents = []
+                reagent_pairs_text = ""
+                summary = "No evidence found, skip reference"
+                is_high_quality = False
+                qc_justification = (
+                    _join_unique_texts(skip_reasons)
+                    or f"No evidence found across {total_chunks} chunk(s)"
+                )
             
             ref_source = _format_ref_source(pmc)
             
@@ -1758,6 +2210,10 @@ def process_gene_set(fbgn_ids: list[str], keywords_list: list[str], reference_li
                 "gene_symbol": fly_symbol,
                 "flybase_id": fbgn_id,
                 "summary": summary,
+                "function_text": final_function_summary.get("function", ""),
+                "phenotypes_text": final_function_summary.get("phenotypes", ""),
+                "reagent_pairs": reagent_pairs_text,
+                "reagents": merged_reagents,
                 "abstract_text": abstract or "",
                 "is_high_quality": is_high_quality,
                 "qc_justification": qc_justification,
@@ -1817,7 +2273,7 @@ def process_gene_set(fbgn_ids: list[str], keywords_list: list[str], reference_li
 
 
 def generate_excel_output(fly_gene_hits, all_summaries, validated, output_path, gene_set_df=None):
-    """Generate Excel output with Gene Set, Classification and Reference Summaries sheets."""
+    """Generate Excel output with Gene Set, Classification, Reference Summaries and Reagents sheets."""
     import pandas as pd
     from openpyxl.styles import Alignment, PatternFill, Font
     from openpyxl.utils import get_column_letter
@@ -1877,6 +2333,7 @@ def generate_excel_output(fly_gene_hits, all_summaries, validated, output_path, 
     
     # Reference Summaries sheet
     ref_rows = []
+    reagent_rows = []
     for sd in all_summaries or []:
         fly_sym = sd.get("gene_symbol", "")
         fbgn = sd.get("flybase_id", "")
@@ -1909,11 +2366,31 @@ def generate_excel_output(fly_gene_hits, all_summaries, validated, output_path, 
             "Abstract": sd.get("abstract_text", ""),
             "Classification": cls,
             "Source": sd.get("source", "Unknown"),
+            "Reagent_Pairs": sd.get("reagent_pairs", ""),
         })
+
+        for reagent in sd.get("reagents", []) or []:
+            reagent_rows.append({
+                "Gene": fly_sym,
+                "Paper_ID": sd.get("paper_id", ""),
+                "Title": sd.get("title", ""),
+                "Stock_ID": reagent.get("stock_id", ""),
+                "Collection": reagent.get("collection", ""),
+                "Reagent_Type": reagent.get("reagent_type", ""),
+                "Functional_Validity": reagent.get("functional_validity", ""),
+                "Evidence_Snippet": reagent.get("evidence_snippet", ""),
+                "Reagent_Name": reagent.get("reagent_name", ""),
+                "Source": sd.get("source", "Unknown"),
+            })
     
     ref_df = pd.DataFrame(ref_rows, columns=[
         "Gene", "Gene_ID", "Paper_ID", "Title", "Year", "_year_sort",
-        "Journal", "Author(s)", "Reference Summary", "Abstract", "Classification", "Source"
+        "Journal", "Author(s)", "Reference Summary", "Abstract", "Classification", "Source",
+        "Reagent_Pairs"
+    ])
+    reagent_df = pd.DataFrame(reagent_rows, columns=[
+        "Gene", "Paper_ID", "Title", "Stock_ID", "Collection", "Reagent_Type", "Functional_Validity", "Evidence_Snippet",
+        "Reagent_Name", "Source"
     ])
     
     # Sort references to mirror classification order
@@ -1922,10 +2399,16 @@ def generate_excel_output(fly_gene_hits, all_summaries, validated, output_path, 
         ref_df["_gene_order"] = ref_df["Gene"].map(lambda x: gene_order.get(x, 999999))
         ref_df = ref_df.sort_values(by=["_gene_order", "_year_sort"], ascending=[True, False])
         ref_df = ref_df.drop(columns=["_gene_order"])
+        if not reagent_df.empty:
+            reagent_df["_gene_order"] = reagent_df["Gene"].map(lambda x: gene_order.get(x, 999999))
+            reagent_df = reagent_df.sort_values(
+                by=["_gene_order", "Collection", "Stock_ID"],
+                ascending=[True, True, True]
+            )
+            reagent_df = reagent_df.drop(columns=["_gene_order"])
     
     if "_year_sort" in ref_df.columns:
         ref_df = ref_df.drop(columns=["_year_sort"])
-    
     # Write Excel
     excel_buf = io.BytesIO()
     with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
@@ -1933,6 +2416,7 @@ def generate_excel_output(fly_gene_hits, all_summaries, validated, output_path, 
         gene_df.to_excel(writer, index=False, sheet_name="Gene Set")
         class_df.to_excel(writer, index=False, sheet_name="Classification")
         ref_df.to_excel(writer, index=False, sheet_name="Reference Summaries")
+        reagent_df.to_excel(writer, index=False, sheet_name="Reagents")
         
         # Format Gene Set sheet
         gene_ws = writer.sheets["Gene Set"]
@@ -1996,8 +2480,30 @@ def generate_excel_output(fly_gene_hits, all_summaries, validated, output_path, 
         ref_ws.column_dimensions[get_column_letter(9)].width = 50
         ref_ws.column_dimensions[get_column_letter(10)].width = 15
         ref_ws.column_dimensions[get_column_letter(11)].width = 12
+        ref_ws.column_dimensions[get_column_letter(12)].width = 35
         
         for row in ref_ws.iter_rows(min_row=1, max_row=ref_ws.max_row, min_col=1, max_col=ref_ws.max_column):
+            for cell in row:
+                cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+
+        # Format Reagents sheet
+        reagent_ws = writer.sheets["Reagents"]
+        reagent_widths = {
+            1: 15,
+            2: 12,
+            3: 45,
+            4: 15,
+            5: 15,
+            6: 18,
+            7: 22,
+            8: 60,
+            9: 25,
+            10: 15,
+        }
+        for col_idx, width in reagent_widths.items():
+            reagent_ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+        for row in reagent_ws.iter_rows(min_row=1, max_row=reagent_ws.max_row, min_col=1, max_col=reagent_ws.max_column):
             for cell in row:
                 cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
     
@@ -2008,6 +2514,7 @@ def generate_excel_output(fly_gene_hits, all_summaries, validated, output_path, 
     print(f"\nOutput written to: {output_path}")
     print(f"  - Classification sheet: {len(class_df)} genes")
     print(f"  - Reference Summaries sheet: {len(ref_df)} entries")
+    print(f"  - Reagents sheet: {len(reagent_df)} entries")
 
 
 def _json_dump(path: Path, payload: dict):

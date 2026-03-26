@@ -15,7 +15,7 @@ set -euo pipefail
 PROJECT_DIR="/nfs/turbo/umms-rallada/UM Lab Users/Aadish/fl-ai_gene_classification"
 SCRIPT_PATH="${PROJECT_DIR}/flai-gene-classification.py"
 VENV_DIR="${PROJECT_DIR}/.venv-py310"
-INPUT_DIR="${PROJECT_DIR}/Data/vGAT x Allada+CSW x ShaLiuCommonGene"
+INPUT_DIR="${PROJECT_DIR}/Data/Test-vGAT-extra-small"
 
 echo "[$(date)] Starting job on ${INPUT_DIR}"
 
