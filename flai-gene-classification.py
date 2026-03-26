@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Fly Gene Classification Pipeline (Standalone)
+Fly Gene Classification + Reagent Finder Pipeline (Standalone)
 
 Usage:
     python flai-gene-classification.py <input_directory> [--keywords "kw1,kw2,..."] [--reference-limit N]
 
-This script processes each CSV file in the specified directory that has a 'flybase_gene_id' column.
-Each file is treated as an independent gene set and produces the same output as the Fly (Classification)
-mode in the Streamlit app.
+This script processes each CSV file in the specified directory, reads gene symbols from the
+configured input column, converts them to FlyBase IDs, gathers literature evidence, classifies
+genes against the supplied keywords, and extracts gene-linked reagent records from supporting papers.
 
 Output:
     For each input file <name>.csv, creates <name>_classification.xlsx in the same directory.
@@ -1977,7 +1977,7 @@ def classify_gene_from_text(gene_symbol: str, keywords_list: list[str], full_tex
 
 def process_gene_set(fbgn_ids: list[str], keywords_list: list[str], reference_limit: int = 500):
     """
-    Process a set of FBgn IDs through the fly gene classification pipeline.
+    Process a set of FBgn IDs through the classification and reagent-finder pipeline.
     Returns (classification_results, all_summaries, validated).
     """
     print(f"\n{'='*60}")
@@ -2923,11 +2923,14 @@ def run_fbgnid_conversion(input_directory: str, input_gene_col: str = "ext_gene"
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fly Gene Classification Pipeline - converts input symbols to FBgn IDs, then classifies genes"
+        description=(
+            "Fly gene classification and reagent-finder pipeline - converts input symbols "
+            "to FBgn IDs, summarizes literature, classifies genes, and extracts reagent hits"
+        )
     )
     parser.add_argument(
         "input_directory",
-        help="Directory containing input CSV files for FBgn conversion + classification"
+        help="Directory containing input CSV files for FBgn conversion, classification, and reagent extraction"
     )
     parser.add_argument(
         "--keywords", "-k",
@@ -2971,7 +2974,7 @@ def main():
     keywords_list = [k.strip() for k in args.keywords.split(",") if k.strip()]
     
     print(f"\n{'='*70}")
-    print("Fly Gene Classification Pipeline (Standalone)")
+    print("Fly Gene Classification + Reagent Finder Pipeline (Standalone)")
     print(f"{'='*70}")
     print(f"Input directory: {args.input_directory}")
     print(f"Keywords: {keywords_list if keywords_list else '(none)'}")

@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="2820" viewBox="0 0 1800 2820">
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="3100" viewBox="0 0 1800 3100">
   <defs>
     <style>
       .title { font: 700 68px Arial, sans-serif; fill: #0f172a; }
@@ -12,7 +12,7 @@
     </marker>
   </defs>
 
-  <text x="900" y="100" text-anchor="middle" class="title">Fly Gene Classification Pipeline</text>
+  <text x="900" y="100" text-anchor="middle" class="title">Fly Gene Classification + Reagent Finder Pipeline</text>
 
   <rect x="130" y="160" width="1540" height="190" class="step" />
   <text x="900" y="238" text-anchor="middle" class="steptext">1) Read input directory with CSV files</text>
@@ -22,7 +22,7 @@
 
   <rect x="130" y="410" width="1540" height="190" class="step" />
   <text x="900" y="488" text-anchor="middle" class="steptext">2) Convert symbols to FBgn IDs</text>
-  <text x="900" y="550" text-anchor="middle" class="subtext">Runs HelperScripts/GetFBgnIDs.py before classification</text>
+  <text x="900" y="550" text-anchor="middle" class="subtext">Runs HelperScripts/GetFBgnIDs.py before classification and reagent extraction</text>
 
   <path d="M900 600 L900 660" class="arrow" />
 
@@ -70,13 +70,20 @@
   <path d="M900 2320 L900 2380" class="arrow" />
 
   <rect x="130" y="2380" width="1540" height="220" class="step" />
-  <text x="900" y="2458" text-anchor="middle" class="steptext">9) Aggregate accepted summaries and classify genes</text>
-  <text x="900" y="2516" text-anchor="middle" class="steptext">into keyword categories</text>
-  <text x="900" y="2568" text-anchor="middle" class="subtext">Output category list, confidence score, and rationale</text>
+  <text x="900" y="2458" text-anchor="middle" class="steptext">9) Per passing reference: extract and normalize</text>
+  <text x="900" y="2516" text-anchor="middle" class="steptext">gene-linked reagent records from paper text</text>
+  <text x="900" y="2568" text-anchor="middle" class="subtext">Keep only canonical `(stock_id, collection)` pairs and merge duplicates</text>
 
   <path d="M900 2600 L900 2660" class="arrow" />
 
-  <rect x="130" y="2660" width="1540" height="160" class="step" />
-  <text x="900" y="2730" text-anchor="middle" class="steptext">10) Export &amp; persist artifacts</text>
-  <text x="900" y="2780" text-anchor="middle" class="subtext">Write &lt;input&gt;_classification.xlsx and save run/cache state</text>
+  <rect x="130" y="2660" width="1540" height="220" class="step" />
+  <text x="900" y="2738" text-anchor="middle" class="steptext">10) Aggregate accepted summaries and classify genes</text>
+  <text x="900" y="2796" text-anchor="middle" class="steptext">into keyword categories</text>
+  <text x="900" y="2848" text-anchor="middle" class="subtext">Output category list, confidence score, rationale, and supporting reference set</text>
+
+  <path d="M900 2880 L900 2940" class="arrow" />
+
+  <rect x="130" y="2940" width="1540" height="160" class="step" />
+  <text x="900" y="3010" text-anchor="middle" class="steptext">11) Export &amp; persist artifacts</text>
+  <text x="900" y="3060" text-anchor="middle" class="subtext">Write Gene Set, Classification, Reference Summaries, and Reagents sheets; save run/cache state</text>
 </svg>
