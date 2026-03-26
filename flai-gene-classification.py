@@ -1722,7 +1722,7 @@ def _normalize_stock_id(stock_id: str, collection: str) -> str:
     if collection == "BDSC":
         match = re.fullmatch(r"(?:BL|BDSC)?(\d+)", cleaned, flags=re.IGNORECASE)
         if match:
-            return f"BL{match.group(1)}"
+            return f"{match.group(1)}"
     if collection == "VDRC":
         match = re.fullmatch(r"(?:VDRC)?v?(\d+)", cleaned, flags=re.IGNORECASE)
         if match:
