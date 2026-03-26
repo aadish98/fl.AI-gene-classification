@@ -31,6 +31,7 @@ output/
 results/
 artifacts/
 .batch_state/
+BATCH_SCRIPTS/
 
 # Jupyter
 .ipynb_checkpoints/

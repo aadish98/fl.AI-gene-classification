@@ -33,6 +33,9 @@ from PyPDF2 import PdfReader
 from functools import lru_cache
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+# Prefer repo-local .env for batch jobs, then fall back to default dotenv search.
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 load_dotenv()
 
 # Detect turbo mount: macOS uses /Volumes/umms-rallada, ARC uses /nfs/turbo/umms-rallada
@@ -60,7 +63,29 @@ from glob import glob
 from urllib.parse import quote
 from HelperScripts.metadata_resolver import normalize_authors, resolve_reference_metadata
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+DEFAULT_OPENAI_MODEL = "gpt-5.4"
+_openai_client: Optional[OpenAI] = None
+
+
+def _get_openai_model(model_name: Optional[str] = None) -> str:
+    """Resolve model from explicit arg, env var, or safe default."""
+    model = str(model_name or os.getenv("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL).strip()
+    return model or DEFAULT_OPENAI_MODEL
+
+
+def _get_openai_client() -> OpenAI:
+    """Create OpenAI client lazily with a clear missing-key error."""
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
+    api_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. Export it in the environment "
+            "or add it to a .env file in the project root."
+        )
+    _openai_client = OpenAI(api_key=api_key)
+    return _openai_client
 
 # Shared FlyBase data location for this standalone script.
 FLYBASE_DATA = TURBO_ROOT / "UM Lab Users" / "Aadish" / "Data" / "FlyBase"
@@ -1466,28 +1491,81 @@ def _model_dump(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _build_responses_input(messages: list[dict[str, str]]) -> tuple[Optional[str], list[dict[str, str]]]:
+    """Split chat-style messages into Responses API instructions and input items."""
+    instructions_parts: list[str] = []
+    input_items: list[dict[str, str]] = []
+    for message in messages or []:
+        role = str(message.get("role", "user") or "user").strip()
+        content = str(message.get("content", "") or "").strip()
+        if not content:
+            continue
+        if role == "system":
+            instructions_parts.append(content)
+        else:
+            input_items.append({"role": role, "content": content})
+    instructions = "\n\n".join(instructions_parts).strip()
+    return (instructions or None), input_items
+
+
+def _get_reasoning_config(model_name: Optional[str] = None) -> Optional[dict[str, str]]:
+    """Use high reasoning for GPT-5 family models when supported."""
+    model = _get_openai_model(model_name).lower()
+    if model.startswith("gpt-5"):
+        return {"effort": "high"}
+    return None
+
+
 def _parse_structured_completion(
     messages: list[dict[str, str]],
     response_format,
     model_name: Optional[str] = None,
-    max_completion_tokens: int = 1500,
+    max_output_tokens: int = 1500,
 ):
-    """Call the OpenAI structured-output API with light retries."""
+    """Call the Responses API with structured parsing and light retries."""
     last_err = None
+    model = _get_openai_model(model_name)
+    instructions, input_items = _build_responses_input(messages)
     for attempt in range(3):
         try:
-            completion = client.beta.chat.completions.parse(
-                model=(model_name or os.getenv("OPENAI_MODEL") or "gpt-5-nano"),
-                messages=messages,
-                response_format=response_format,
-                max_completion_tokens=max_completion_tokens,
-            )
-            parsed = completion.choices[0].message.parsed
+            request_kwargs: dict[str, Any] = {
+                "model": model,
+                "input": input_items,
+                "text_format": response_format,
+                "max_output_tokens": max_output_tokens,
+            }
+            if instructions:
+                request_kwargs["instructions"] = instructions
+            reasoning = _get_reasoning_config(model)
+            if reasoning is not None:
+                request_kwargs["reasoning"] = reasoning
+
+            response = _get_openai_client().responses.parse(**request_kwargs)
+            parsed = getattr(response, "output_parsed", None)
             if parsed is not None:
                 return parsed
-            raise ValueError("Empty parsed response from API")
+            raw_output = str(getattr(response, "output_text", "") or "").strip()
+            raise ValueError(f"Empty parsed response from API: {raw_output or 'no output text returned'}")
         except Exception as e:
             last_err = e
+            if "Unsupported parameter: 'reasoning.effort'" in str(e):
+                try:
+                    retry_kwargs: dict[str, Any] = {
+                        "model": model,
+                        "input": input_items,
+                        "text_format": response_format,
+                        "max_output_tokens": max_output_tokens,
+                    }
+                    if instructions:
+                        retry_kwargs["instructions"] = instructions
+                    response = _get_openai_client().responses.parse(**retry_kwargs)
+                    parsed = getattr(response, "output_parsed", None)
+                    if parsed is not None:
+                        return parsed
+                    raw_output = str(getattr(response, "output_text", "") or "").strip()
+                    raise ValueError(f"Empty parsed response from API: {raw_output or 'no output text returned'}")
+                except Exception as retry_error:
+                    last_err = retry_error
             time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(str(last_err))
 
@@ -1534,7 +1612,7 @@ Text chunk:
             [{"role": "system", "content": sys}, {"role": "user", "content": user}],
             response_format=FunctionPhenotypeSummary,
             model_name=model_name,
-            max_completion_tokens=1200,
+            max_output_tokens=1200,
         )
         parsed = _model_dump(out)
         function_text = _clean_text(parsed.get("function", ""))
@@ -1605,7 +1683,7 @@ Chunk summaries:
             [{"role": "system", "content": sys}, {"role": "user", "content": user}],
             response_format=FinalFunctionPhenotypeSummary,
             model_name=model_name,
-            max_completion_tokens=1200,
+            max_output_tokens=1200,
         )
         parsed = _model_dump(out)
         return {
@@ -1710,7 +1788,7 @@ Text chunk:
             [{"role": "system", "content": sys}, {"role": "user", "content": user}],
             response_format=ReagentExtraction,
             model_name=model_name,
-            max_completion_tokens=1800,
+            max_output_tokens=1800,
         )
         parsed = _model_dump(out)
         normalized = []
@@ -1851,13 +1929,11 @@ def classify_gene_from_text(gene_symbol: str, keywords_list: list[str], full_tex
     )
 
     try:
-        completion = client.beta.chat.completions.parse(
-            model=os.getenv("OPENAI_MODEL") or "gpt-5-mini",
-            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        out = _parse_structured_completion(
+            [{"role": "system", "content": sys}, {"role": "user", "content": user}],
             response_format=GeneClassification,
-            max_completion_tokens=1000,
+            max_output_tokens=4000,
         )
-        out = completion.choices[0].message.parsed
         if not out:
             return {"gene": gene_symbol, "category": [], "confidence": 0, "rationale": "Empty response from API"}
         
@@ -1877,13 +1953,11 @@ def classify_gene_from_text(gene_symbol: str, keywords_list: list[str], full_tex
         if "length limit was reached" in error_msg or "maximum context length" in error_msg:
             try:
                 shorter_text = full_text[:50000]
-                completion = client.beta.chat.completions.parse(
-                    model=os.getenv("OPENAI_MODEL") or "gpt-5-mini",
-                    messages=[{"role": "system", "content": sys}, {"role": "user", "content": user.replace(full_text[:200000], shorter_text)}],
+                out = _parse_structured_completion(
+                    [{"role": "system", "content": sys}, {"role": "user", "content": user.replace(full_text[:200000], shorter_text)}],
                     response_format=GeneClassification,
-                    max_completion_tokens=500,
+                    max_output_tokens=2000,
                 )
-                out = completion.choices[0].message.parsed
                 if out:
                     category_list = _normalize_category_output(out.category, valid_cats)
                     return {
@@ -2906,6 +2980,14 @@ def main():
     print(f"Force all: {'yes' if args.force_all else 'no'}")
     print("Run FBgnID conversion: yes (default)")
     print(f"FBgn conversion input gene column: {args.input_gene_col}")
+
+    # Fail fast on API misconfiguration so runs do not silently produce empty outputs.
+    try:
+        _get_openai_client()
+    except Exception as e:
+        print(f"Error: OpenAI API setup invalid: {e}")
+        sys.exit(1)
+    print(f"OpenAI model: {_get_openai_model()}")
 
     # Step 0: convert input symbols to FBgn IDs.
     ok = run_fbgnid_conversion(args.input_directory, args.input_gene_col)
