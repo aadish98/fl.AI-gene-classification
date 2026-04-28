@@ -16,6 +16,12 @@ from pathlib import Path
 
 import pandas as pd
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from HelperScripts.flybase_data import ensure_flybase_data_files, resolve_flybase_data_dir
+
 symbol_to_name = {
     'α': 'alpha',
     'β': 'beta',
@@ -68,13 +74,7 @@ symbol_to_name = {
 }
 
 
-# Detect turbo mount: macOS uses /Volumes/umms-rallada, ARC uses /nfs/turbo/umms-rallada
-_TURBO_CANDIDATES = [
-    Path("/Volumes/umms-rallada"),       # macOS
-    Path("/nfs/turbo/umms-rallada"),      # ARC-HPC (Linux)
-]
-_TURBO_ROOT = next((p for p in _TURBO_CANDIDATES if p.exists()), _TURBO_CANDIDATES[0])
-DEFAULT_FLYBASE_DATA = _TURBO_ROOT / "UM Lab Users" / "Aadish" / "Data" / "FlyBase"
+DEFAULT_FLYBASE_DATA = resolve_flybase_data_dir()
 
 
 def replace_symbol(gene_series):
@@ -402,6 +402,16 @@ def process_csv_file(csv_file, gene_column, gene_to_fbgnid_main, synonym_to_fbgn
     print(f"File saved to {csv_file} with {df.shape[0]} rows.")
 
 
+def _is_generated_csv(path: str | Path) -> bool:
+    """Skip derived pipeline outputs when mapping original input symbols."""
+    name = Path(path).name
+    return (
+        name.endswith("_human.csv")
+        or name.endswith("_mouse.csv")
+        or name.endswith("_classification.csv")
+    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Map input fly gene symbols to FlyBase FBgn IDs in CSV files."
@@ -426,11 +436,19 @@ def main(argv=None):
         return 1
 
     flybase_data_dir = Path(args.flybase_data_dir)
-    if not flybase_data_dir.exists():
-        print(f"Error: FlyBase data directory not found at: {flybase_data_dir}")
+    missing_flybase = ensure_flybase_data_files(flybase_data_dir, download_missing=True)
+    synonym_missing = [item for item in missing_flybase if item["pattern"] == "fb_synonym"]
+    if synonym_missing:
+        print(f"Error: FlyBase synonym data is missing under: {flybase_data_dir}")
+        for requirement in synonym_missing:
+            print(f"  - Could not retrieve {requirement['label']}: {requirement['url']}")
         return 1
 
-    csv_files = sorted(glob(str(input_dir / "*.csv")))
+    csv_files = [
+        csv_file
+        for csv_file in sorted(glob(str(input_dir / "*.csv")))
+        if not _is_generated_csv(csv_file)
+    ]
     if not csv_files:
         print(f"No CSV files found in {input_dir}")
         return 0
