@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from functools import lru_cache
 from pathlib import Path
+from datetime import datetime, timezone
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 # Prefer repo-local .env for batch jobs, then fall back to default dotenv search.
@@ -71,7 +72,85 @@ DEFAULT_SUMMARY_MODEL = "gpt-5.4-nano"
 DEFAULT_CLASSIFICATION_MODEL = "gpt-5.4"
 DEFAULT_SUMMARY_REASONING_EFFORT = "medium"
 DEFAULT_CLASSIFICATION_REASONING_EFFORT = "high"
+OPENAI_PRICING_CSV_PATH = PROJECT_ROOT / "Data" / "openai_pricing.csv"
+SOFT_RUN_REFERENCE_PROFILES_PATH = PROJECT_ROOT / ".flai_system" / "soft_run_reference_profiles.json"
+LITELLM_PRICING_URL = (
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+    "model_prices_and_context_window.json"
+)
+INPUT_TOKENS_PER_REF = 6500
+OUTPUT_CAP_PER_REF = 1200
+INPUT_TOKENS_PER_CLASSIFICATION = 2000
+OUTPUT_CAP_PER_CLASSIFICATION = 4000
 _openai_client: Optional[OpenAI] = None
+
+
+@dataclass
+class ModelPricing:
+    model: str
+    input_per_1m: float
+    cached_input_per_1m: float
+    output_per_1m: float
+    source: str = ""
+    fetched_at_utc: str = ""
+
+
+@dataclass
+class SoftRunFileEstimate:
+    csv_path: str
+    total_genes: int = 0
+    reused_genes: int = 0
+    planned_genes: int = 0
+    candidate_references: float = 0
+    limited_references: float = 0
+    metadata_keyword_matches: float = 0
+    n_refs: float = 0
+    n_genes_classified: int = 0
+    keyword_pass_rate: float = 1.0
+    keyword_pass_rate_source: str = "fallback"
+    keyword_pass_rate_limited_references: int = 0
+    keyword_pass_rate_metadata_keyword_matches: int = 0
+
+
+@dataclass
+class SoftRunEstimate:
+    files: list[SoftRunFileEstimate] = field(default_factory=list)
+    summary_model: str = ""
+    classification_model: str = ""
+    summary_pricing: Optional[ModelPricing] = None
+    classification_pricing: Optional[ModelPricing] = None
+
+    @property
+    def total_genes(self) -> int:
+        return sum(item.total_genes for item in self.files)
+
+    @property
+    def reused_genes(self) -> int:
+        return sum(item.reused_genes for item in self.files)
+
+    @property
+    def planned_genes(self) -> int:
+        return sum(item.planned_genes for item in self.files)
+
+    @property
+    def candidate_references(self) -> float:
+        return sum(item.candidate_references for item in self.files)
+
+    @property
+    def limited_references(self) -> float:
+        return sum(item.limited_references for item in self.files)
+
+    @property
+    def metadata_keyword_matches(self) -> float:
+        return sum(item.metadata_keyword_matches for item in self.files)
+
+    @property
+    def n_refs(self) -> float:
+        return sum(item.n_refs for item in self.files)
+
+    @property
+    def n_genes_classified(self) -> int:
+        return sum(item.n_genes_classified for item in self.files)
 
 
 def _resolve_openai_model(
@@ -143,6 +222,260 @@ def log_step(message: str, detail: str = "", indent: int = 0):
     prefix = "  " * max(indent, 0)
     suffix = f" - {detail}" if detail else ""
     print(f"{prefix}[Pipeline] {message}{suffix}")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _to_float(value: object, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _normalize_pricing_model_name(model: str) -> str:
+    """Normalize dated model names for pricing lookup without guessing families."""
+    name = str(model or "").strip()
+    if name.startswith("openai/"):
+        name = name.split("/", 1)[1]
+    return re.sub(r"-\d{4}-\d{2}-\d{2}$", "", name)
+
+
+def _load_soft_run_system_profiles() -> dict[str, Any]:
+    try:
+        with open(SOFT_RUN_REFERENCE_PROFILES_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return {"profiles": [], "species_keyword_pass_rates": {}}
+    if not isinstance(payload, dict):
+        return {"profiles": [], "species_keyword_pass_rates": {}}
+    payload.setdefault("profiles", [])
+    payload.setdefault("species_keyword_pass_rates", {})
+    return payload
+
+
+def _save_soft_run_system_profiles(payload: dict[str, Any]):
+    SOFT_RUN_REFERENCE_PROFILES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = SOFT_RUN_REFERENCE_PROFILES_PATH.with_suffix(".json.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True)
+    os.replace(tmp_path, SOFT_RUN_REFERENCE_PROFILES_PATH)
+
+
+def _resolve_soft_run_reference_profile(summary_model: str, classification_model: str) -> Optional[dict[str, object]]:
+    """Return empirical token averages for a known soft-run model pair, if available."""
+    key = (
+        _normalize_pricing_model_name(summary_model),
+        _normalize_pricing_model_name(classification_model),
+    )
+    payload = _load_soft_run_system_profiles()
+    profiles = payload.get("profiles", []) if isinstance(payload, dict) else []
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        profile_key = (
+            _normalize_pricing_model_name(str(profile.get("summary_model", "") or "")),
+            _normalize_pricing_model_name(str(profile.get("classification_model", "") or "")),
+        )
+        if profile_key == key:
+            return profile
+    return None
+
+
+def _resolve_species_keyword_pass_rate(species: str) -> dict[str, object]:
+    """Resolve the empirical keyword pass rate used by fast soft-run."""
+    species_key = str(species or "fly").strip().lower() or "fly"
+    payload = _load_soft_run_system_profiles()
+    rates = payload.get("species_keyword_pass_rates", {}) if isinstance(payload, dict) else {}
+    rate_info = rates.get(species_key, {}) if isinstance(rates, dict) else {}
+    if isinstance(rate_info, dict):
+        rate = _to_float(rate_info.get("keyword_pass_rate"), default=1.0)
+        return {
+            "species": species_key,
+            "keyword_pass_rate": max(0.0, min(1.0, rate)),
+            "source": str(rate_info.get("source", "system profile") or "system profile"),
+            "calibration_limited_references": int(_to_float(rate_info.get("calibration_limited_references"))),
+            "calibration_metadata_keyword_matches": int(_to_float(rate_info.get("calibration_metadata_keyword_matches"))),
+            "updated_at_utc": str(rate_info.get("updated_at_utc", "") or ""),
+        }
+    return {
+        "species": species_key,
+        "keyword_pass_rate": 1.0,
+        "source": "fallback upper bound",
+        "calibration_limited_references": 0,
+        "calibration_metadata_keyword_matches": 0,
+        "updated_at_utc": "",
+    }
+
+
+def _maybe_update_species_keyword_pass_rate(
+    species: str,
+    observed_limited_references: int,
+    observed_metadata_keyword_matches: int,
+    *,
+    source: str,
+    reference_limit: int,
+) -> bool:
+    """Refresh species pass-rate calibration only when the completed run is larger."""
+    species_key = str(species or "fly").strip().lower() or "fly"
+    observed_limited = int(observed_limited_references or 0)
+    observed_matches = int(observed_metadata_keyword_matches or 0)
+    if observed_limited <= 0:
+        return False
+    payload = _load_soft_run_system_profiles()
+    rates = payload.setdefault("species_keyword_pass_rates", {})
+    if not isinstance(rates, dict):
+        rates = {}
+        payload["species_keyword_pass_rates"] = rates
+    existing = rates.get(species_key, {})
+    existing_limited = 0
+    if isinstance(existing, dict):
+        existing_limited = int(_to_float(existing.get("calibration_limited_references")))
+    if observed_limited < existing_limited:
+        return False
+
+    rates[species_key] = {
+        "keyword_pass_rate": max(0.0, min(1.0, observed_matches / observed_limited)),
+        "calibration_limited_references": observed_limited,
+        "calibration_metadata_keyword_matches": observed_matches,
+        "reference_limit": int(reference_limit or 0),
+        "source": str(source or "real run"),
+        "updated_at_utc": _utc_now_iso(),
+    }
+    _save_soft_run_system_profiles(payload)
+    return True
+
+
+def _refresh_openai_pricing_csv() -> bool:
+    """Refresh model pricing from LiteLLM's public JSON without calling OpenAI."""
+    try:
+        response = requests.get(LITELLM_PRICING_URL, timeout=20)
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("pricing payload was not a JSON object")
+
+        fetched_at = _utc_now_iso()
+        excluded_modes = {
+            "embedding",
+            "image_generation",
+            "audio_transcription",
+            "audio_speech",
+            "moderation",
+        }
+        rows: list[dict[str, object]] = []
+        for model_name, info in payload.items():
+            if not isinstance(info, dict):
+                continue
+            clean_model = str(model_name or "").strip()
+            provider = str(info.get("litellm_provider", "") or "").strip().lower()
+            if provider != "openai" and not clean_model.startswith("openai/"):
+                continue
+            mode = str(info.get("mode", "") or "").strip().lower()
+            if mode in excluded_modes:
+                continue
+            lower_model = clean_model.lower()
+            if any(token in lower_model for token in ("embedding", "image", "audio", "tts", "whisper", "moderation")):
+                continue
+
+            input_per_1m = _to_float(info.get("input_cost_per_token")) * 1_000_000
+            cached_input_per_1m = _to_float(
+                info.get("cache_read_input_token_cost")
+                or info.get("input_cost_per_token_batches")
+            ) * 1_000_000
+            output_per_1m = _to_float(info.get("output_cost_per_token")) * 1_000_000
+            if input_per_1m <= 0 and output_per_1m <= 0:
+                continue
+
+            model_key = _normalize_pricing_model_name(clean_model)
+            rows.append({
+                "model": model_key,
+                "input_per_1m": input_per_1m,
+                "cached_input_per_1m": cached_input_per_1m,
+                "output_per_1m": output_per_1m,
+                "source": LITELLM_PRICING_URL,
+                "fetched_at_utc": fetched_at,
+            })
+
+        if not rows:
+            raise RuntimeError("no OpenAI text model pricing rows found")
+
+        df = pd.DataFrame(rows)
+        df = df.drop_duplicates(subset=["model"], keep="first").sort_values("model")
+        OPENAI_PRICING_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = OPENAI_PRICING_CSV_PATH.with_suffix(".csv.tmp")
+        df.to_csv(tmp_path, index=False)
+        tmp_path.replace(OPENAI_PRICING_CSV_PATH)
+        print(f"  Refreshed OpenAI pricing table: {OPENAI_PRICING_CSV_PATH}")
+        return True
+    except Exception as e:
+        print(f"  [Warning] Could not refresh OpenAI pricing table: {e}")
+        return False
+
+
+def _load_openai_pricing_table(refresh: bool = False) -> dict[str, ModelPricing]:
+    """Load pricing from the external CSV, refreshing first for soft-run when requested."""
+    if refresh:
+        refreshed = _refresh_openai_pricing_csv()
+        if not refreshed and OPENAI_PRICING_CSV_PATH.exists():
+            try:
+                existing = pd.read_csv(OPENAI_PRICING_CSV_PATH, dtype=str, keep_default_na=False)
+                fetched_values = sorted({
+                    str(x).strip() for x in existing.get("fetched_at_utc", []) if str(x).strip()
+                })
+                fetched_at = fetched_values[-1] if fetched_values else "unknown"
+                print(f"  Using cached OpenAI pricing table from {fetched_at}")
+            except Exception:
+                print("  Using cached OpenAI pricing table")
+
+    if not OPENAI_PRICING_CSV_PATH.exists():
+        raise RuntimeError(
+            f"OpenAI pricing table is missing: {OPENAI_PRICING_CSV_PATH}. "
+            "Run --soft-run with network access or populate the CSV."
+        )
+
+    df = pd.read_csv(OPENAI_PRICING_CSV_PATH, dtype=str, keep_default_na=False)
+    required = {"model", "input_per_1m", "cached_input_per_1m", "output_per_1m", "source", "fetched_at_utc"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise RuntimeError(f"OpenAI pricing CSV is missing columns: {', '.join(sorted(missing))}")
+
+    table: dict[str, ModelPricing] = {}
+    for _, row in df.iterrows():
+        model = _normalize_pricing_model_name(row.get("model", ""))
+        if not model:
+            continue
+        table[model] = ModelPricing(
+            model=model,
+            input_per_1m=_to_float(row.get("input_per_1m")),
+            cached_input_per_1m=_to_float(row.get("cached_input_per_1m")),
+            output_per_1m=_to_float(row.get("output_per_1m")),
+            source=str(row.get("source", "") or ""),
+            fetched_at_utc=str(row.get("fetched_at_utc", "") or ""),
+        )
+    if not table:
+        raise RuntimeError(f"OpenAI pricing CSV has no usable pricing rows: {OPENAI_PRICING_CSV_PATH}")
+    return table
+
+
+def _resolve_model_pricing(model: str, table: dict[str, ModelPricing]) -> ModelPricing:
+    model_name = str(model or "").strip()
+    candidates = [model_name, _normalize_pricing_model_name(model_name)]
+    for candidate in candidates:
+        if candidate in table:
+            return table[candidate]
+    available = ", ".join(sorted(table)[:40])
+    if len(table) > 40:
+        available += ", ..."
+    raise RuntimeError(
+        f"No OpenAI pricing entry found for model '{model_name}'. "
+        f"Supported pricing models include: {available}"
+    )
 
 
 ###############################################################################
@@ -1851,6 +2184,91 @@ def _model_dump(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _compact_numeric_dict(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep usage payloads JSON-friendly without preserving provider internals verbatim."""
+    out: dict[str, Any] = {}
+    for key, value in (payload or {}).items():
+        if isinstance(value, dict):
+            nested = _compact_numeric_dict(value)
+            if nested:
+                out[key] = nested
+            continue
+        if isinstance(value, (int, float, str, bool)) or value is None:
+            out[key] = value
+    return out
+
+
+def _extract_openai_usage(response: Any) -> dict[str, Any]:
+    """Extract token usage from a Responses API object."""
+    usage = getattr(response, "usage", None)
+    usage_dict = _model_dump(usage)
+    if not usage_dict and isinstance(usage, dict):
+        usage_dict = dict(usage)
+    return _compact_numeric_dict(usage_dict)
+
+
+def _record_openai_usage_event(
+    response: Any,
+    usage_events: Optional[list[dict[str, Any]]],
+    usage_context: Optional[dict[str, Any]],
+    *,
+    model: str,
+    max_output_tokens: int,
+    reasoning_effort: Optional[str],
+    attempt: int,
+):
+    """Append one successful OpenAI request event for later calibration."""
+    if usage_events is None:
+        return
+    usage = _extract_openai_usage(response)
+    event = {
+        "timestamp_utc": _utc_now_iso(),
+        "request_type": str((usage_context or {}).get("request_type", "structured_completion") or "structured_completion"),
+        "model": str(model or ""),
+        "max_output_tokens": int(max_output_tokens or 0),
+        "attempt": int(attempt),
+        "usage": usage,
+    }
+    if reasoning_effort:
+        event["reasoning_effort"] = str(reasoning_effort)
+    for key, value in (usage_context or {}).items():
+        if key == "request_type":
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            event[key] = value
+    usage_events.append(event)
+
+
+def _summarize_openai_usage_events(events: list[dict[str, Any]]) -> dict[str, int]:
+    """Aggregate token usage for a cached gene record."""
+    totals = {
+        "request_count": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_output_tokens": 0,
+    }
+    for event in events or []:
+        usage = event.get("usage", {}) if isinstance(event, dict) else {}
+        if not isinstance(usage, dict):
+            continue
+        totals["request_count"] += 1
+        input_tokens = int(_to_float(usage.get("input_tokens")))
+        output_tokens = int(_to_float(usage.get("output_tokens")))
+        total_tokens = int(_to_float(usage.get("total_tokens"))) or input_tokens + output_tokens
+        totals["input_tokens"] += input_tokens
+        totals["output_tokens"] += output_tokens
+        totals["total_tokens"] += total_tokens
+        input_details = usage.get("input_tokens_details", {})
+        if isinstance(input_details, dict):
+            totals["cached_input_tokens"] += int(_to_float(input_details.get("cached_tokens")))
+        output_details = usage.get("output_tokens_details", {})
+        if isinstance(output_details, dict):
+            totals["reasoning_output_tokens"] += int(_to_float(output_details.get("reasoning_tokens")))
+    return totals
+
+
 def _build_responses_input(messages: list[dict[str, str]]) -> tuple[Optional[str], list[dict[str, str]]]:
     """Split chat-style messages into Responses API instructions and input items."""
     instructions_parts: list[str] = []
@@ -1886,6 +2304,8 @@ def _parse_structured_completion(
     model_name: Optional[str] = None,
     max_output_tokens: int = 1500,
     reasoning_effort: Optional[str] = None,
+    usage_events: Optional[list[dict[str, Any]]] = None,
+    usage_context: Optional[dict[str, Any]] = None,
 ):
     """Call the Responses API with structured parsing and light retries."""
     last_err = None
@@ -1910,6 +2330,15 @@ def _parse_structured_completion(
             response = _get_openai_client().responses.parse(**request_kwargs)
             parsed = getattr(response, "output_parsed", None)
             if parsed is not None:
+                _record_openai_usage_event(
+                    response,
+                    usage_events,
+                    usage_context,
+                    model=model,
+                    max_output_tokens=max_output_tokens,
+                    reasoning_effort=reasoning_effort,
+                    attempt=attempt + 1,
+                )
                 return parsed
             raw_output = str(getattr(response, "output_text", "") or "").strip()
             raise ValueError(f"Empty parsed response from API: {raw_output or 'no output text returned'}")
@@ -1931,6 +2360,15 @@ def _parse_structured_completion(
                     response = _get_openai_client().responses.parse(**retry_kwargs)
                     parsed = getattr(response, "output_parsed", None)
                     if parsed is not None:
+                        _record_openai_usage_event(
+                            response,
+                            usage_events,
+                            usage_context,
+                            model=model,
+                            max_output_tokens=max_output_tokens,
+                            reasoning_effort=None,
+                            attempt=attempt + 1,
+                        )
                         return parsed
                     raw_output = str(getattr(response, "output_text", "") or "").strip()
                     raise ValueError(f"Empty parsed response from API: {raw_output or 'no output text returned'}")
@@ -1943,18 +2381,14 @@ def _parse_structured_completion(
     raise RuntimeError(str(last_err))
 
 
-def summarize_reference_function(
+def _build_summary_messages(
     text_chunk: str,
     gene_symbol: str,
     fbgn_id: str,
     synonyms: list[str],
-    model_name: Optional[str] = None,
     title: str = "",
     abstract: str = "",
-    chunk_index: int = 1,
-    total_chunks: int = 1,
-) -> dict[str, Any]:
-    """Extract function and phenotype evidence for one chunk of a paper."""
+) -> list[dict[str, str]]:
     synonyms_str = ", ".join(sorted(set(synonyms))) if synonyms else ""
     sys = (
         "You are an expert biomedical assistant. Use ONLY the provided title, abstract, "
@@ -1980,17 +2414,100 @@ Abstract: {abstract or ''}
 
 Text chunk:
 {text_chunk or ''}"""
+    return [{"role": "system", "content": sys}, {"role": "user", "content": user}]
+
+
+def _build_rewrite_messages(
+    gene_symbol: str,
+    fbgn_id: str,
+    chunk_summaries: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    chunk_lines = []
+    for idx, chunk_summary in enumerate(chunk_summaries or [], start=1):
+        function_text = _clean_text(chunk_summary.get("function", ""))
+        phenotype_text = _clean_text(chunk_summary.get("phenotypes", ""))
+        chunk_lines.append(
+            f"Chunk {idx}\n"
+            f"Function: {function_text or 'None'}\n"
+            f"Phenotypes: {phenotype_text or 'None'}"
+        )
+    merged_input = "\n\n".join(chunk_lines)
+    sys = (
+        "You are an expert biomedical assistant. Merge chunk-level evidence summaries into a "
+        "single cohesive paper-level summary. Use ONLY the provided chunk summaries."
+    )
+    user = f"""Rewrite these chunk-level summaries for gene {gene_symbol} (Gene ID: {fbgn_id}) into one cohesive paper summary.
+
+Return JSON with fields:
+- function
+- phenotypes
+
+Rules:
+- Always name {gene_symbol} explicitly
+- Preserve factual content only
+- Remove redundancy across chunks
+- Do not introduce new claims
+
+Chunk summaries:
+{merged_input}"""
+    return [{"role": "system", "content": sys}, {"role": "user", "content": user}]
+
+
+def _build_classification_messages(
+    gene_symbol: str,
+    keywords_list: list[str],
+    full_text: str,
+) -> list[dict[str, str]]:
+    cats = [k.strip() for k in keywords_list if k and k.strip() and k.strip().lower() != "none"]
+    cats_line = ", ".join(cats) if cats else "None"
+    sys = (
+        "You are an expert biomedical assistant. Use ONLY the provided text. "
+        "If evidence is weak or ambiguous, return category as empty list [] or None."
+    )
+    user = (
+        f"Classify gene '{gene_symbol}'. Allowed categories: [{cats_line}]. "
+        "You may classify into 1 category, N categories, or None (return empty list [] or None). "
+        "Return JSON with fields: gene, category (list of strings, can be empty or None), confidence (0-100), rationale (1-2 lines).\n\n"
+        "TEXT START\n" + full_text[:200000] + "\nTEXT END"
+    )
+    return [{"role": "system", "content": sys}, {"role": "user", "content": user}]
+
+
+def summarize_reference_function(
+    text_chunk: str,
+    gene_symbol: str,
+    fbgn_id: str,
+    synonyms: list[str],
+    model_name: Optional[str] = None,
+    title: str = "",
+    abstract: str = "",
+    chunk_index: int = 1,
+    total_chunks: int = 1,
+    paper_id: str = "",
+    usage_events: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Extract function and phenotype evidence for one chunk of a paper."""
     try:
         summary_model = _get_summary_model(model_name)
         out = _parse_structured_completion(
-            [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            _build_summary_messages(text_chunk, gene_symbol, fbgn_id, synonyms, title=title, abstract=abstract),
             response_format=FunctionPhenotypeSummary,
             model_name=summary_model,
-            max_output_tokens=1200,
+            max_output_tokens=OUTPUT_CAP_PER_REF,
             reasoning_effort=_get_reasoning_effort(
                 "OPENAI_SUMMARY_REASONING_EFFORT",
                 DEFAULT_SUMMARY_REASONING_EFFORT,
             ),
+            usage_events=usage_events,
+            usage_context={
+                "request_type": "summary_chunk",
+                "gene_symbol": gene_symbol,
+                "gene_id": fbgn_id,
+                "paper_id": paper_id,
+                "chunk_index": int(chunk_index),
+                "total_chunks": int(total_chunks),
+                "chunk_words": _count_words(text_chunk),
+            },
         )
         parsed = _model_dump(out)
         function_text = _clean_text(parsed.get("function", ""))
@@ -2022,53 +2539,33 @@ def rewrite_function_summary(
     fbgn_id: str,
     chunk_summaries: list[dict[str, Any]],
     model_name: Optional[str] = None,
+    paper_id: str = "",
+    usage_events: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, str]:
     """Rewrite multiple chunk-level summaries into one cohesive paper summary."""
-    chunk_lines = []
-    for idx, chunk_summary in enumerate(chunk_summaries or [], start=1):
-        function_text = _clean_text(chunk_summary.get("function", ""))
-        phenotype_text = _clean_text(chunk_summary.get("phenotypes", ""))
-        chunk_lines.append(
-            f"Chunk {idx}\n"
-            f"Function: {function_text or 'None'}\n"
-            f"Phenotypes: {phenotype_text or 'None'}"
-        )
-    merged_input = "\n\n".join(chunk_lines)
-
     fallback = {
         "function": _join_unique_texts([summary.get("function", "") for summary in chunk_summaries]),
         "phenotypes": _join_unique_texts([summary.get("phenotypes", "") for summary in chunk_summaries]),
     }
-
-    sys = (
-        "You are an expert biomedical assistant. Merge chunk-level evidence summaries into a "
-        "single cohesive paper-level summary. Use ONLY the provided chunk summaries."
-    )
-    user = f"""Rewrite these chunk-level summaries for gene {gene_symbol} (Gene ID: {fbgn_id}) into one cohesive paper summary.
-
-Return JSON with fields:
-- function
-- phenotypes
-
-Rules:
-- Always name {gene_symbol} explicitly
-- Preserve factual content only
-- Remove redundancy across chunks
-- Do not introduce new claims
-
-Chunk summaries:
-{merged_input}"""
     try:
         summary_model = _get_summary_model(model_name)
         out = _parse_structured_completion(
-            [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            _build_rewrite_messages(gene_symbol, fbgn_id, chunk_summaries),
             response_format=FinalFunctionPhenotypeSummary,
             model_name=summary_model,
-            max_output_tokens=1200,
+            max_output_tokens=OUTPUT_CAP_PER_REF,
             reasoning_effort=_get_reasoning_effort(
                 "OPENAI_SUMMARY_REASONING_EFFORT",
                 DEFAULT_SUMMARY_REASONING_EFFORT,
             ),
+            usage_events=usage_events,
+            usage_context={
+                "request_type": "summary_rewrite",
+                "gene_symbol": gene_symbol,
+                "gene_id": fbgn_id,
+                "paper_id": paper_id,
+                "chunk_count": len(chunk_summaries or []),
+            },
         )
         parsed = _model_dump(out)
         return {
@@ -2146,6 +2643,9 @@ def classify_gene_from_text(
     keywords_list: list[str],
     full_text: str,
     model_name: Optional[str] = None,
+    gene_id: str = "",
+    usage_events: Optional[list[dict[str, Any]]] = None,
+    high_quality_reference_count: int = 0,
 ):
     """Classify a gene using GPT."""
     if not full_text or not full_text.strip():
@@ -2153,30 +2653,27 @@ def classify_gene_from_text(
     
     cats = [k.strip() for k in keywords_list if k and k.strip() and k.strip().lower() != "none"]
     valid_cats = set(cats) if cats else set()
-    cats_line = ", ".join(cats) if cats else "None"
-
-    sys = (
-        "You are an expert biomedical assistant. Use ONLY the provided text. "
-        "If evidence is weak or ambiguous, return category as empty list [] or None."
-    )
-    user = (
-        f"Classify gene '{gene_symbol}'. Allowed categories: [{cats_line}]. "
-        "You may classify into 1 category, N categories, or None (return empty list [] or None). "
-        "Return JSON with fields: gene, category (list of strings, can be empty or None), confidence (0-100), rationale (1-2 lines).\n\n"
-        "TEXT START\n" + full_text[:200000] + "\nTEXT END"
-    )
+    messages = _build_classification_messages(gene_symbol, keywords_list, full_text)
 
     try:
         classification_model = _get_classification_model(model_name)
         out = _parse_structured_completion(
-            [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            messages,
             response_format=GeneClassification,
             model_name=classification_model,
-            max_output_tokens=4000,
+            max_output_tokens=OUTPUT_CAP_PER_CLASSIFICATION,
             reasoning_effort=_get_reasoning_effort(
                 "OPENAI_CLASSIFICATION_REASONING_EFFORT",
                 DEFAULT_CLASSIFICATION_REASONING_EFFORT,
             ),
+            usage_events=usage_events,
+            usage_context={
+                "request_type": "classification",
+                "gene_symbol": gene_symbol,
+                "gene_id": gene_id,
+                "high_quality_reference_count": int(high_quality_reference_count),
+                "classification_text_words": _count_words(full_text),
+            },
         )
         if not out:
             return {"gene": gene_symbol, "category": [], "confidence": 0, "rationale": "Empty response from API"}
@@ -2198,7 +2695,7 @@ def classify_gene_from_text(
             try:
                 shorter_text = full_text[:50000]
                 out = _parse_structured_completion(
-                    [{"role": "system", "content": sys}, {"role": "user", "content": user.replace(full_text[:200000], shorter_text)}],
+                    _build_classification_messages(gene_symbol, keywords_list, shorter_text),
                     response_format=GeneClassification,
                     model_name=_get_classification_model(model_name),
                     max_output_tokens=2000,
@@ -2206,6 +2703,14 @@ def classify_gene_from_text(
                         "OPENAI_CLASSIFICATION_REASONING_EFFORT",
                         DEFAULT_CLASSIFICATION_REASONING_EFFORT,
                     ),
+                    usage_events=usage_events,
+                    usage_context={
+                        "request_type": "classification_retry_short_context",
+                        "gene_symbol": gene_symbol,
+                        "gene_id": gene_id,
+                        "high_quality_reference_count": int(high_quality_reference_count),
+                        "classification_text_words": _count_words(shorter_text),
+                    },
                 )
                 if out:
                     category_list = _normalize_category_output(out.category, valid_cats)
@@ -2248,7 +2753,7 @@ def process_gene_set(
     validated: dict[str, GeneRecord] = {gene.symbol: gene for gene in genes}
     if not validated:
         print("No valid genes found.")
-        return {}, [], {}
+        return {}, [], {}, {}, {}
 
     if adapter.key == "fly":
         log_step("Loading FlyBase reference maps", indent=1)
@@ -2343,6 +2848,7 @@ def process_gene_set(
     for gene_id, candidate_map in gene_to_candidates.items():
         sorted_papers = sorted(candidate_map.keys(), key=_sort_key_sources_then_recency, reverse=True)
         gene_to_papers[gene_id] = set(sorted_papers[:reference_limit])
+    calibration_limited_references = sum(len(papers) for papers in gene_to_papers.values())
 
     log_step("Ranking and limiting references", f"limit={reference_limit} per gene", indent=1)
     print("\n[Metadata] Filtering references by keywords and fetching metadata...")
@@ -2392,6 +2898,7 @@ def process_gene_set(
                         high_quality_papers_per_gene[gene.gene_id].add(paper_norm)
         except Exception:
             meta_cache[paper_norm] = ("", "", "n.d.", "", [], "")
+    calibration_metadata_keyword_matches = sum(len(papers) for papers in high_quality_papers_per_gene.values())
 
     print("\n[Summaries] Summarizing and classifying genes...")
     log_step("Retrieving full text, summarizing evidence, and classifying genes", indent=1)
@@ -2399,6 +2906,7 @@ def process_gene_set(
     gene_to_papers_all = defaultdict(set)
     gene_high_quality_ref_summaries = defaultdict(list)
     gene_to_full_text_papers = defaultdict(set)
+    gene_to_openai_usage_events: dict[str, list[dict[str, Any]]] = defaultdict(list)
     all_summaries = []
     gene_hits = {}
 
@@ -2460,6 +2968,7 @@ def process_gene_set(
                 abstract=abstract,
             )
             total_chunks = len(shared_chunks)
+            chunk_word_counts = [_count_words(chunk) for chunk in shared_chunks]
             function_chunk_summaries = []
             skip_reasons = []
             for chunk_index, text_chunk in enumerate(shared_chunks, start=1):
@@ -2472,6 +2981,8 @@ def process_gene_set(
                     abstract=abstract,
                     chunk_index=chunk_index,
                     total_chunks=total_chunks,
+                    paper_id=paper_id,
+                    usage_events=gene_to_openai_usage_events[gene.gene_id],
                 )
                 if chunk_summary.get("skip_reference", True):
                     if chunk_summary.get("skip_reason"):
@@ -2491,6 +3002,8 @@ def process_gene_set(
                         gene.symbol,
                         gene.gene_id,
                         function_chunk_summaries,
+                        paper_id=paper_id,
+                        usage_events=gene_to_openai_usage_events[gene.gene_id],
                     )
                 summary = _format_reference_summary(
                     final_function_summary.get("function", ""),
@@ -2519,6 +3032,10 @@ def process_gene_set(
                 "function_text": final_function_summary.get("function", ""),
                 "phenotypes_text": final_function_summary.get("phenotypes", ""),
                 "abstract_text": abstract or "",
+                "full_text_source": source_label,
+                "full_text_word_count": _count_words(full_text if source_label != "Title+Abstract only" else ""),
+                "chunk_count": total_chunks,
+                "chunk_word_counts": chunk_word_counts,
                 "is_high_quality": is_high_quality,
                 "qc_justification": qc_justification,
                 "source": _format_ref_source(paper_id),
@@ -2537,7 +3054,14 @@ def process_gene_set(
         if chunks:
             print(f"    Classifying from {len(chunks)} high-quality summary chunk(s)")
             agg_text = "\n\n".join(chunks)
-            cls = classify_gene_from_text(gene.symbol, keywords_list, agg_text)
+            cls = classify_gene_from_text(
+                gene.symbol,
+                keywords_list,
+                agg_text,
+                gene_id=gene.gene_id,
+                usage_events=gene_to_openai_usage_events[gene.gene_id],
+                high_quality_reference_count=len(chunks),
+            )
             if not cls or not isinstance(cls, dict):
                 cls = {"gene": gene.symbol, "category": [], "confidence": 0, "rationale": "Classification failed"}
             category_list = cls.get("category", [])
@@ -2565,7 +3089,337 @@ def process_gene_set(
             print("    Classification: None (no relevant references)")
 
     log_step("Gene set complete", f"{len(gene_hits)} genes classified, {len(all_summaries)} reference summaries", indent=1)
-    return gene_hits, all_summaries, validated
+    calibration_stats = {
+        "species": adapter.key,
+        "limited_references": int(calibration_limited_references),
+        "metadata_keyword_matches": int(calibration_metadata_keyword_matches),
+    }
+    return gene_hits, all_summaries, validated, dict(gene_to_openai_usage_events), calibration_stats
+
+
+def _plan_soft_run_gene_set(
+    genes: list[GeneRecord],
+    keywords_list: list[str],
+    reference_limit: int = 500,
+    adapter: SpeciesAdapter | None = None,
+) -> SoftRunFileEstimate:
+    """Plan OpenAI-bound references using fast candidate counts; never fetch full text."""
+    adapter = adapter or get_species_adapter("fly")
+    genes = [gene for gene in (genes or []) if isinstance(gene, GeneRecord) and gene.gene_id]
+    estimate = SoftRunFileEstimate(csv_path="", total_genes=len(genes), planned_genes=len(genes))
+    if not genes:
+        return estimate
+
+    pass_rate_info = _resolve_species_keyword_pass_rate(adapter.key)
+    keyword_pass_rate = _to_float(pass_rate_info.get("keyword_pass_rate"), default=1.0)
+    estimate.keyword_pass_rate = keyword_pass_rate
+    estimate.keyword_pass_rate_source = str(pass_rate_info.get("source", "") or "fallback")
+    estimate.keyword_pass_rate_limited_references = int(_to_float(pass_rate_info.get("calibration_limited_references")))
+    estimate.keyword_pass_rate_metadata_keyword_matches = int(
+        _to_float(pass_rate_info.get("calibration_metadata_keyword_matches"))
+    )
+    print(
+        f"  Fast soft-run keyword-pass proxy: species={adapter.key}, "
+        f"pass_rate={keyword_pass_rate:.4f}, source={estimate.keyword_pass_rate_source}"
+    )
+
+    if adapter.key == "fly":
+        log_step("Loading FlyBase reference maps", indent=1)
+    pmcid_to_year = build_pmcid_to_year() if adapter.key == "fly" else {}
+
+    paper_sources: dict[str, set[str]] = defaultdict(set)
+    gene_to_candidates: dict[str, dict[str, ReferenceCandidate]] = defaultdict(dict)
+
+    def _paper_key(paper_id: str) -> str:
+        text = str(paper_id or "").strip()
+        return text.upper() if text.upper().startswith("PMC") else text
+
+    def _add_candidate(candidate: ReferenceCandidate):
+        paper_key = _paper_key(candidate.paper_id)
+        if not paper_key:
+            return
+        candidate.paper_id = paper_key
+        existing = gene_to_candidates[candidate.gene_id].get(paper_key)
+        if existing:
+            existing.source_labels.add(candidate.source_label)
+            if candidate.pmid and not existing.pmid:
+                existing.pmid = candidate.pmid
+            if candidate.pmcid and not existing.pmcid:
+                existing.pmcid = candidate.pmcid
+            if candidate.snippet and not existing.snippet:
+                existing.snippet = candidate.snippet
+        else:
+            gene_to_candidates[candidate.gene_id][paper_key] = candidate
+        paper_sources[paper_key].add(candidate.source_key)
+
+    providers = adapter.reference_providers()
+    log_step("Collecting candidate references", f"{len(providers)} source(s)", indent=1)
+    for step_index, provider in enumerate(providers, start=1):
+        print(f"\n[Soft-run Step {step_index}] Fetching references from {provider.source_label}...")
+        try:
+            collected = provider.collect_many(genes, keywords_list)
+        except Exception as e:
+            print(f"  [Warning] {provider.source_label} failed: {e}")
+            collected = {}
+        source_total = 0
+        genes_with_refs = 0
+        for gene in genes:
+            candidates = collected.get(gene.gene_id, []) or []
+            source_total += len(candidates)
+            if candidates:
+                genes_with_refs += 1
+            for candidate in candidates:
+                _add_candidate(candidate)
+        print(
+            f"  {provider.source_label}: {source_total} references "
+            f"across {genes_with_refs}/{len(genes)} genes"
+        )
+
+    def _source_priority(sources: set[str]) -> int:
+        if len(sources) >= 2:
+            return 100 + len(sources)
+        return max((adapter.source_priority.get(source, 0) for source in sources), default=0)
+
+    def _paper_numeric(paper_id: str) -> int:
+        try:
+            return int(re.sub(r"\D+", "", str(paper_id)))
+        except Exception:
+            return 0
+
+    def _sort_key_sources_then_recency(paper_id: str):
+        paper_norm = _paper_key(paper_id)
+        year = pmcid_to_year.get(paper_norm, 0)
+        return (_source_priority(paper_sources.get(paper_norm, set())), year, _paper_numeric(paper_norm))
+
+    gene_to_papers: dict[str, set[str]] = {}
+    for gene_id, candidate_map in gene_to_candidates.items():
+        estimate.candidate_references += len(candidate_map)
+        sorted_papers = sorted(candidate_map.keys(), key=_sort_key_sources_then_recency, reverse=True)
+        limited = set(sorted_papers[:reference_limit])
+        estimate.limited_references += len(limited)
+        gene_to_papers[gene_id] = limited
+
+    log_step("Estimating keyword matches from candidate counts", f"pass_rate={keyword_pass_rate:.4f}", indent=1)
+    for papers in gene_to_papers.values():
+        limited_count = len(papers)
+        estimated_refs_for_gene = min(limited_count * keyword_pass_rate, reference_limit)
+        estimate.metadata_keyword_matches += estimated_refs_for_gene
+        estimate.n_refs += estimated_refs_for_gene
+        if estimated_refs_for_gene >= 1:
+            estimate.n_genes_classified += 1
+    return estimate
+
+
+def _estimate_costs(
+    n_refs: float,
+    n_genes_classified: int,
+    summary_pricing: ModelPricing,
+    classification_pricing: ModelPricing,
+    average_profile: Optional[dict[str, object]] = None,
+) -> dict[str, float]:
+    summary_input_tokens = n_refs * INPUT_TOKENS_PER_REF
+    summary_output_tokens = n_refs * OUTPUT_CAP_PER_REF
+    classification_input_tokens = n_genes_classified * INPUT_TOKENS_PER_CLASSIFICATION
+    classification_output_tokens = n_genes_classified * OUTPUT_CAP_PER_CLASSIFICATION
+    input_cost = (
+        (summary_input_tokens / 1_000_000) * summary_pricing.input_per_1m
+        + (classification_input_tokens / 1_000_000) * classification_pricing.input_per_1m
+    )
+    output_cost = (
+        (summary_output_tokens / 1_000_000) * summary_pricing.output_per_1m
+        + (classification_output_tokens / 1_000_000) * classification_pricing.output_per_1m
+    )
+    result = {
+        "summary_input_tokens": float(summary_input_tokens),
+        "summary_output_tokens": float(summary_output_tokens),
+        "classification_input_tokens": float(classification_input_tokens),
+        "classification_output_tokens": float(classification_output_tokens),
+        "input_tokens": float(summary_input_tokens + classification_input_tokens),
+        "output_tokens": float(summary_output_tokens + classification_output_tokens),
+        "input_cost": input_cost,
+        "output_cost": output_cost,
+        "total_cost": input_cost + output_cost,
+    }
+    if average_profile:
+        summary_expected_input_tokens = (
+            n_refs * _to_float(average_profile.get("summary_input_tokens_per_reference"))
+        )
+        summary_expected_output_tokens = (
+            n_refs * _to_float(average_profile.get("summary_output_tokens_per_reference"))
+        )
+        classification_expected_input_tokens = (
+            n_genes_classified * _to_float(average_profile.get("classification_input_tokens_per_gene"))
+        )
+        classification_expected_output_tokens = (
+            n_genes_classified * _to_float(average_profile.get("classification_output_tokens_per_gene"))
+        )
+        expected_input_cost = (
+            (summary_expected_input_tokens / 1_000_000) * summary_pricing.input_per_1m
+            + (classification_expected_input_tokens / 1_000_000) * classification_pricing.input_per_1m
+        )
+        expected_output_cost = (
+            (summary_expected_output_tokens / 1_000_000) * summary_pricing.output_per_1m
+            + (classification_expected_output_tokens / 1_000_000) * classification_pricing.output_per_1m
+        )
+        result.update({
+            "expected_summary_input_tokens": float(summary_expected_input_tokens),
+            "expected_summary_output_tokens": float(summary_expected_output_tokens),
+            "expected_classification_input_tokens": float(classification_expected_input_tokens),
+            "expected_classification_output_tokens": float(classification_expected_output_tokens),
+            "expected_input_tokens": float(summary_expected_input_tokens + classification_expected_input_tokens),
+            "expected_output_tokens": float(summary_expected_output_tokens + classification_expected_output_tokens),
+            "expected_model_requests": float(
+                n_refs * _to_float(average_profile.get("summary_requests_per_reference"))
+                + n_genes_classified * _to_float(average_profile.get("classification_requests_per_gene"), 1.0)
+            ),
+            "expected_input_cost": expected_input_cost,
+            "expected_output_cost": expected_output_cost,
+            "expected_total_cost": expected_input_cost + expected_output_cost,
+        })
+    return result
+
+
+def _print_soft_run_report(estimate: SoftRunEstimate):
+    summary_pricing = estimate.summary_pricing
+    classification_pricing = estimate.classification_pricing
+    if summary_pricing is None or classification_pricing is None:
+        raise RuntimeError("Soft-run estimate is missing model pricing")
+
+    def _money(value: float) -> str:
+        return f"${value:,.4f}"
+
+    def _refs(value: float) -> str:
+        return f"{value:,.1f}" if abs(float(value or 0) - int(float(value or 0))) > 1e-9 else f"{int(value):,}"
+
+    average_profile = _resolve_soft_run_reference_profile(
+        estimate.summary_model,
+        estimate.classification_model,
+    )
+
+    print(f"\n{'='*70}")
+    print("Soft-Run OpenAI Cost Estimate")
+    print(f"{'='*70}")
+    print("No OpenAI calls were made. No full paper text was fetched.")
+    print(f"Summary model: {estimate.summary_model}")
+    print(
+        f"  Rates: input=${summary_pricing.input_per_1m:g}/1M, "
+        f"output=${summary_pricing.output_per_1m:g}/1M"
+    )
+    print(f"Classification model: {estimate.classification_model}")
+    print(
+        f"  Rates: input=${classification_pricing.input_per_1m:g}/1M, "
+        f"output=${classification_pricing.output_per_1m:g}/1M"
+    )
+    print("\nAssumptions:")
+    print(f"  INPUT_TOKENS_PER_REF={INPUT_TOKENS_PER_REF}")
+    print(f"  OUTPUT_CAP_PER_REF={OUTPUT_CAP_PER_REF}")
+    print(f"  INPUT_TOKENS_PER_CLASSIFICATION={INPUT_TOKENS_PER_CLASSIFICATION}")
+    print(f"  OUTPUT_CAP_PER_CLASSIFICATION={OUTPUT_CAP_PER_CLASSIFICATION}")
+    if average_profile:
+        print("\nEmpirical reference-average profile:")
+        print(f"  {average_profile.get('label', 'unnamed profile')}")
+        print(f"  Source: {average_profile.get('source', 'unknown')}")
+        print(
+            "  Per reference: "
+            f"summary_requests={_to_float(average_profile.get('summary_requests_per_reference')):.2f}, "
+            f"summary_input_tokens={_to_float(average_profile.get('summary_input_tokens_per_reference')):,.0f}, "
+            f"summary_output_tokens={_to_float(average_profile.get('summary_output_tokens_per_reference')):,.0f}"
+        )
+        print(
+            "  Per GPT-classified gene: "
+            f"classification_input_tokens={_to_float(average_profile.get('classification_input_tokens_per_gene')):,.0f}, "
+            f"classification_output_tokens={_to_float(average_profile.get('classification_output_tokens_per_gene')):,.0f}"
+        )
+
+    print("\nPer-file estimates:")
+    for file_estimate in estimate.files:
+        costs = _estimate_costs(
+            file_estimate.n_refs,
+            file_estimate.n_genes_classified,
+            summary_pricing,
+            classification_pricing,
+            average_profile,
+        )
+        print(f"\n  {file_estimate.csv_path}")
+        print(
+            f"    genes: total={file_estimate.total_genes}, reused={file_estimate.reused_genes}, "
+            f"planned={file_estimate.planned_genes}"
+        )
+        print(
+            f"    references: candidates={file_estimate.candidate_references}, "
+            f"after_reference_limit={file_estimate.limited_references}, "
+            f"estimated_keyword_matches={_refs(file_estimate.metadata_keyword_matches)}"
+        )
+        print(
+            f"    fast keyword-pass proxy: species_rate={file_estimate.keyword_pass_rate:.4f}, "
+            f"calibration_limited_refs={file_estimate.keyword_pass_rate_limited_references:,}, "
+            f"source={file_estimate.keyword_pass_rate_source}"
+        )
+        print(
+            f"    N_refs={_refs(file_estimate.n_refs)}, "
+            f"N_genes_classified={file_estimate.n_genes_classified}"
+        )
+        print(
+            f"    tokens: input={int(costs['input_tokens']):,}, "
+            f"capped_output={int(costs['output_tokens']):,}"
+        )
+        if "expected_total_cost" in costs:
+            print(
+                f"    reference-average tokens: input={int(costs['expected_input_tokens']):,}, "
+                f"output={int(costs['expected_output_tokens']):,}, "
+                f"requests={costs['expected_model_requests']:,.1f}"
+            )
+            print(
+                f"    Reference-average cost: {_money(costs['expected_total_cost'])} "
+                "(empirical planning estimate)"
+            )
+        print(
+            f"    Estimated input cost: {_money(costs['input_cost'])}\n"
+            f"    Capped output cost: {_money(costs['output_cost'])} (upper-bound component, not expected spend)\n"
+            f"    Estimated total upper-bound cost: {_money(costs['total_cost'])}"
+        )
+
+    total_costs = _estimate_costs(
+        estimate.n_refs,
+        estimate.n_genes_classified,
+        summary_pricing,
+        classification_pricing,
+        average_profile,
+    )
+    print(f"\n{'-'*70}")
+    print("Total")
+    print(
+        f"Genes: total={estimate.total_genes}, reused={estimate.reused_genes}, "
+        f"planned={estimate.planned_genes}"
+    )
+    print(
+        f"References: candidates={estimate.candidate_references}, "
+        f"after_reference_limit={estimate.limited_references}, "
+        f"estimated_keyword_matches={_refs(estimate.metadata_keyword_matches)}"
+    )
+    print(f"N_refs={_refs(estimate.n_refs)}, N_genes_classified={estimate.n_genes_classified}")
+    print(
+        f"Tokens: input={int(total_costs['input_tokens']):,}, "
+        f"capped_output={int(total_costs['output_tokens']):,}"
+    )
+    if "expected_total_cost" in total_costs:
+        print(
+            f"Reference-average tokens: input={int(total_costs['expected_input_tokens']):,}, "
+            f"output={int(total_costs['expected_output_tokens']):,}, "
+            f"requests={total_costs['expected_model_requests']:,.1f}"
+        )
+        print(f"Reference-average cost: {_money(total_costs['expected_total_cost'])} (empirical planning estimate)")
+    print(f"Estimated input cost: {_money(total_costs['input_cost'])}")
+    print(f"Capped output cost: {_money(total_costs['output_cost'])} (upper-bound component, not expected spend)")
+    print(f"Estimated total upper-bound cost: {_money(total_costs['total_cost'])}")
+    print(
+        "\nNote: this fast soft-run estimate uses candidate-reference counts and an empirical "
+        "species keyword-pass rate instead of resolving every title/abstract. It does not fetch "
+        "full paper text, does not model full-text chunking, and does not model the "
+        "evidence-quality stop condition that can end real processing after six high-quality "
+        "references per gene."
+    )
+    print(f"{'='*70}")
 
 
 def generate_excel_output(gene_hits, all_summaries, validated, output_path, gene_set_df=None, adapter: SpeciesAdapter | None = None):
@@ -2953,6 +3807,7 @@ def _build_gene_records(
     gene_hits: dict,
     all_summaries: list[dict],
     validated: dict[str, GeneRecord],
+    openai_usage_by_gene_id: Optional[dict[str, list[dict[str, Any]]]] = None,
 ) -> list[dict]:
     summaries_by_gene_id: dict[str, list[dict]] = defaultdict(list)
     for summary in all_summaries or []:
@@ -2965,6 +3820,7 @@ def _build_gene_records(
         if not isinstance(gene, GeneRecord):
             gene = GeneRecord(species="fly", gene_id=str(gene), symbol=str(gene_symbol), authority_id=str(gene))
         info = gene_hits.get(gene_symbol, {})
+        openai_usage_events = list((openai_usage_by_gene_id or {}).get(str(gene.gene_id), []) or [])
         records.append({
             "gene_record": _serialize_gene_record(gene),
             # Legacy fields for older run stores and easier inspection.
@@ -2972,6 +3828,10 @@ def _build_gene_records(
             "gene_symbol": str(gene_symbol),
             "hit_info": _serialize_hit_info(info),
             "summaries": summaries_by_gene_id.get(str(gene.gene_id), []),
+            "openai_usage": {
+                "totals": _summarize_openai_usage_events(openai_usage_events),
+                "requests": openai_usage_events,
+            },
         })
     return records
 
@@ -3188,6 +4048,10 @@ def process_csv_file(
     if completed_batches and not force_all:
         print(f"Resuming: {len(completed_batches)}/{len(batches)} batches already complete.")
 
+    calibration_totals = {
+        "limited_references": 0,
+        "metadata_keyword_matches": 0,
+    }
     for batch_index, batch_gene_records in enumerate(batches):
         if (batch_index in completed_batches) and not force_all:
             print(f"  Skipping completed batch {batch_index + 1}/{len(batches)}")
@@ -3212,10 +4076,19 @@ def process_csv_file(
             processed_records: list[dict] = []
             if to_process:
                 log_step("Running gene classification batch", f"{len(to_process)} uncached gene(s)", indent=1)
-                gene_hits, all_summaries, validated = process_gene_set(
+                gene_hits, all_summaries, validated, openai_usage_by_gene_id, calibration_stats = process_gene_set(
                     to_process, keywords_list, reference_limit, adapter=adapter
                 )
-                processed_records = _build_gene_records(gene_hits, all_summaries, validated)
+                calibration_totals["limited_references"] += int(calibration_stats.get("limited_references", 0) or 0)
+                calibration_totals["metadata_keyword_matches"] += int(
+                    calibration_stats.get("metadata_keyword_matches", 0) or 0
+                )
+                processed_records = _build_gene_records(
+                    gene_hits,
+                    all_summaries,
+                    validated,
+                    openai_usage_by_gene_id=openai_usage_by_gene_id,
+                )
 
                 for record in processed_records:
                     gene_record = _deserialize_gene_record(record.get("gene_record", {}))
@@ -3295,8 +4168,142 @@ def process_csv_file(
     log_step("Generating final workbook", output_path, indent=1)
     
     generate_excel_output(gene_hits, all_summaries, validated, output_path, gene_set_df=df, adapter=adapter)
+
+    if calibration_totals["limited_references"] > 0:
+        updated = _maybe_update_species_keyword_pass_rate(
+            adapter.key,
+            calibration_totals["limited_references"],
+            calibration_totals["metadata_keyword_matches"],
+            source=str(Path(csv_path).resolve()),
+            reference_limit=reference_limit,
+        )
+        if updated:
+            log_step(
+                "Updated fast soft-run keyword-pass calibration",
+                (
+                    f"species={adapter.key}, "
+                    f"limited_refs={calibration_totals['limited_references']}, "
+                    f"matches={calibration_totals['metadata_keyword_matches']}"
+                ),
+                indent=1,
+            )
     
     return True
+
+
+def soft_run_csv_file(
+    csv_path: str,
+    keywords_list: list[str],
+    reference_limit: int,
+    input_directory: str,
+    run_store: dict,
+    adapter: SpeciesAdapter | None = None,
+    diopt_filter: str = "",
+    input_gene_col: str = "ext_gene",
+    force_all: bool = False,
+) -> Optional[SoftRunFileEstimate]:
+    """Estimate OpenAI-bound work for a CSV without OpenAI or full-text calls."""
+    adapter = adapter or get_species_adapter("fly")
+    print(f"\n{'#'*70}")
+    print(f"Soft-run estimating file: {csv_path}")
+    print(f"{'#'*70}")
+
+    log_step("Reading input CSV", str(csv_path), indent=1)
+    try:
+        df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    except Exception as e:
+        print(f"Error reading CSV: {e}")
+        return None
+
+    id_col = _input_id_column_for_adapter(adapter)
+    if id_col not in df.columns:
+        print(f"Skipping: No '{id_col}' column found")
+        return None
+
+    log_step("Resolving input rows to gene records", f"id column={id_col}", indent=1)
+    gene_records = _gene_records_from_df(df, adapter, input_gene_col=input_gene_col)
+    if not gene_records:
+        print(f"Skipping: No valid {adapter.display_name} gene IDs found")
+        return None
+
+    gene_ids = [gene.gene_id for gene in gene_records]
+    print(f"Found {len(gene_ids)} unique {adapter.display_name} gene IDs")
+
+    input_fingerprint = _make_input_fingerprint(
+        gene_ids, keywords_list, reference_limit, species=adapter.key, diopt_filter=diopt_filter
+    )
+    state_dir = _get_csv_state_dir(input_directory, csv_path, species=adapter.key)
+    state_path = state_dir / "state.json"
+    state_default = {
+        "version": CACHE_SCHEMA_VERSION,
+        "csv_path": str(Path(csv_path).resolve()),
+        "input_fingerprint": input_fingerprint,
+        "total_batches": 0,
+        "completed_batches": [],
+        "batch_files": {},
+        "processed_genes": 0,
+        "reused_genes": 0,
+    }
+    state = _json_load(state_path, default=state_default)
+    if not isinstance(state, dict):
+        state = dict(state_default)
+    if force_all or state.get("input_fingerprint") != input_fingerprint:
+        completed_batches: set[int] = set()
+    else:
+        completed_batches = set(int(x) for x in (state.get("completed_batches", []) or []))
+
+    batches = [gene_records[i:i + BATCH_SIZE] for i in range(0, len(gene_records), BATCH_SIZE)]
+    estimate = SoftRunFileEstimate(csv_path=csv_path, total_genes=len(gene_records))
+    pass_rate_info = _resolve_species_keyword_pass_rate(adapter.key)
+    estimate.keyword_pass_rate = _to_float(pass_rate_info.get("keyword_pass_rate"), default=1.0)
+    estimate.keyword_pass_rate_source = str(pass_rate_info.get("source", "") or "fallback")
+    estimate.keyword_pass_rate_limited_references = int(_to_float(pass_rate_info.get("calibration_limited_references")))
+    estimate.keyword_pass_rate_metadata_keyword_matches = int(
+        _to_float(pass_rate_info.get("calibration_metadata_keyword_matches"))
+    )
+    if completed_batches and not force_all:
+        print(f"Soft-run cache: {len(completed_batches)}/{len(batches)} completed batch(es) excluded from new cost")
+
+    for batch_index, batch_gene_records in enumerate(batches):
+        if (batch_index in completed_batches) and not force_all:
+            estimate.reused_genes += len(batch_gene_records)
+            continue
+
+        to_process: list[GeneRecord] = []
+        dedup_hits = 0
+        for gene in batch_gene_records:
+            store_key = _make_gene_store_key(
+                gene.gene_id, keywords_list, reference_limit, species=adapter.key
+            )
+            if (not force_all) and store_key in run_store.get("genes", {}):
+                dedup_hits += 1
+            else:
+                to_process.append(gene)
+        estimate.reused_genes += dedup_hits
+        estimate.planned_genes += len(to_process)
+        print(
+            f"\n[Soft-run Batch {batch_index + 1}/{len(batches)}] "
+            f"reused={dedup_hits}, planned={len(to_process)}"
+        )
+        if not to_process:
+            continue
+        batch_estimate = _plan_soft_run_gene_set(
+            to_process,
+            keywords_list,
+            reference_limit=reference_limit,
+            adapter=adapter,
+        )
+        estimate.candidate_references += batch_estimate.candidate_references
+        estimate.limited_references += batch_estimate.limited_references
+        estimate.metadata_keyword_matches += batch_estimate.metadata_keyword_matches
+        estimate.n_refs += batch_estimate.n_refs
+        estimate.n_genes_classified += batch_estimate.n_genes_classified
+        estimate.keyword_pass_rate = batch_estimate.keyword_pass_rate
+        estimate.keyword_pass_rate_source = batch_estimate.keyword_pass_rate_source
+        estimate.keyword_pass_rate_limited_references = batch_estimate.keyword_pass_rate_limited_references
+        estimate.keyword_pass_rate_metadata_keyword_matches = batch_estimate.keyword_pass_rate_metadata_keyword_matches
+
+    return estimate
 
 
 def run_fbgnid_conversion(
@@ -3368,6 +4375,14 @@ def main():
         help="Ignore checkpoint/resume state and reprocess all genes from scratch."
     )
     parser.add_argument(
+        "--soft-run",
+        action="store_true",
+        help=(
+            "Estimate OpenAI API usage and cost from metadata only. "
+            "Does not call OpenAI, fetch full paper text, or write classification outputs."
+        )
+    )
+    parser.add_argument(
         "--orthologs",
         choices=["none", "human", "mouse"],
         default="none",
@@ -3402,6 +4417,12 @@ def main():
         "--diopt-cache-dir",
         default="",
         help="Optional cache directory for DIOPT API responses."
+    )
+    parser.add_argument(
+        "--diopt-workers",
+        type=int,
+        default=8,
+        help="Concurrent DIOPT lookup workers for ortholog mapping (default: 8)."
     )
     
     args = parser.parse_args()
@@ -3445,25 +4466,49 @@ def main():
     print(f"FlyBase data: {FLYBASE_DATA}")
     print(f"PubMed cache: {PUBMED_CACHE_DIR}")
     print(f"Force all: {'yes' if args.force_all else 'no'}")
+    print(f"Soft run: {'yes' if args.soft_run else 'no'}")
     print(f"Ortholog mode: {args.orthologs}")
     print(f"DIOPT filter: {args.diopt_filter}")
+    if args.orthologs != "none":
+        print(f"DIOPT workers: {max(1, args.diopt_workers)}")
     print("Run FBgnID conversion: yes (default)")
     print(f"FBgn conversion input gene column: {args.input_gene_col}")
 
     # Fail fast on API misconfiguration so runs do not silently produce empty outputs.
-    log_step("Validating OpenAI configuration")
-    try:
-        _get_openai_client()
-    except Exception as e:
-        print(f"Error: OpenAI API setup invalid: {e}")
-        sys.exit(1)
-    print(f"OpenAI summary model: {_get_summary_model()}")
-    print(f"OpenAI classification model: {_get_classification_model()}")
-    print(
-        "OpenAI reasoning effort: "
-        f"summary={_get_reasoning_effort('OPENAI_SUMMARY_REASONING_EFFORT', DEFAULT_SUMMARY_REASONING_EFFORT)}, "
-        f"classification={_get_reasoning_effort('OPENAI_CLASSIFICATION_REASONING_EFFORT', DEFAULT_CLASSIFICATION_REASONING_EFFORT)}"
-    )
+    summary_model = _get_summary_model()
+    classification_model = _get_classification_model()
+    soft_run_estimate: Optional[SoftRunEstimate] = None
+    if args.soft_run:
+        log_step("Refreshing OpenAI pricing table for soft-run")
+        try:
+            pricing_table = _load_openai_pricing_table(refresh=True)
+            summary_pricing = _resolve_model_pricing(summary_model, pricing_table)
+            classification_pricing = _resolve_model_pricing(classification_model, pricing_table)
+        except Exception as e:
+            print(f"Error: could not prepare OpenAI pricing table: {e}")
+            sys.exit(1)
+        soft_run_estimate = SoftRunEstimate(
+            summary_model=summary_model,
+            classification_model=classification_model,
+            summary_pricing=summary_pricing,
+            classification_pricing=classification_pricing,
+        )
+        print(f"OpenAI summary model: {summary_model}")
+        print(f"OpenAI classification model: {classification_model}")
+    else:
+        log_step("Validating OpenAI configuration")
+        try:
+            _get_openai_client()
+        except Exception as e:
+            print(f"Error: OpenAI API setup invalid: {e}")
+            sys.exit(1)
+        print(f"OpenAI summary model: {summary_model}")
+        print(f"OpenAI classification model: {classification_model}")
+        print(
+            "OpenAI reasoning effort: "
+            f"summary={_get_reasoning_effort('OPENAI_SUMMARY_REASONING_EFFORT', DEFAULT_SUMMARY_REASONING_EFFORT)}, "
+            f"classification={_get_reasoning_effort('OPENAI_CLASSIFICATION_REASONING_EFFORT', DEFAULT_CLASSIFICATION_REASONING_EFFORT)}"
+        )
 
     # Step 0: convert input symbols to FBgn IDs.
     log_step("Converting input gene symbols to FBgn IDs")
@@ -3489,6 +4534,7 @@ def main():
                 flybase_data_dir=FLYBASE_DATA,
                 cache_dir=args.diopt_cache_dir or None,
                 reuse_existing=not args.force_all,
+                diopt_workers=args.diopt_workers,
             )
         except Exception as e:
             print(f"Error creating {args.orthologs} ortholog CSVs: {e}")
@@ -3516,8 +4562,11 @@ def main():
     
     print(f"\nFound {len(csv_files)} CSV files to process")
     batch_root = _get_batch_root(args.input_directory)
-    log_step("Preparing batch state directory", str(batch_root))
-    batch_root.mkdir(parents=True, exist_ok=True)
+    if args.soft_run:
+        log_step("Inspecting batch state directory", str(batch_root))
+    else:
+        log_step("Preparing batch state directory", str(batch_root))
+        batch_root.mkdir(parents=True, exist_ok=True)
     log_step("Loading run-store cache")
     run_store = _load_run_store(args.input_directory)
     
@@ -3525,21 +4574,40 @@ def main():
     success_count = 0
     for csv_path in sorted(csv_files):
         try:
-            if process_csv_file(
-                csv_path,
-                keywords_list,
-                args.reference_limit,
-                args.input_directory,
-                run_store,
-                adapter=adapter,
-                diopt_filter=args.diopt_filter if args.orthologs != "none" else "",
-                input_gene_col=args.input_gene_col,
-                force_all=args.force_all,
-            ):
-                success_count += 1
+            if args.soft_run:
+                file_estimate = soft_run_csv_file(
+                    csv_path,
+                    keywords_list,
+                    args.reference_limit,
+                    args.input_directory,
+                    run_store,
+                    adapter=adapter,
+                    diopt_filter=args.diopt_filter if args.orthologs != "none" else "",
+                    input_gene_col=args.input_gene_col,
+                    force_all=args.force_all,
+                )
+                if file_estimate is not None:
+                    soft_run_estimate.files.append(file_estimate)  # type: ignore[union-attr]
+                    success_count += 1
+                else:
+                    print(f"\nError estimating {csv_path}; exiting early.")
+                    sys.exit(1)
             else:
-                print(f"\nError processing {csv_path}; exiting early to preserve checkpoints.")
-                sys.exit(1)
+                if process_csv_file(
+                    csv_path,
+                    keywords_list,
+                    args.reference_limit,
+                    args.input_directory,
+                    run_store,
+                    adapter=adapter,
+                    diopt_filter=args.diopt_filter if args.orthologs != "none" else "",
+                    input_gene_col=args.input_gene_col,
+                    force_all=args.force_all,
+                ):
+                    success_count += 1
+                else:
+                    print(f"\nError processing {csv_path}; exiting early to preserve checkpoints.")
+                    sys.exit(1)
         except Exception as e:
             print(f"\nError processing {csv_path}: {e}")
             import traceback
@@ -3549,10 +4617,15 @@ def main():
     # Persist shared caches for future runs.
     log_step("Saving metadata caches")
     _save_pmid_title_abstract_cache_pending()
-    _save_fulltext_method_cache_pending()
+    if not args.soft_run:
+        _save_fulltext_method_cache_pending()
+
+    if args.soft_run:
+        _print_soft_run_report(soft_run_estimate)  # type: ignore[arg-type]
     
     print(f"\n{'='*70}")
-    print(f"Complete! Successfully processed {success_count}/{len(csv_files)} files")
+    action = "estimated" if args.soft_run else "processed"
+    print(f"Complete! Successfully {action} {success_count}/{len(csv_files)} files")
     print(f"{'='*70}")
 
 

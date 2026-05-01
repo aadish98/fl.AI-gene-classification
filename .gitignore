@@ -24,8 +24,12 @@ logs/
 *.pid
 
 # Data, results, and pipeline state
-Data/
-data/
+# Keep runtime data ignored, but allow the bundled OpenAI pricing seed CSV.
+Data/*
+!Data/openai_pricing.csv
+data/*
+!Data/
+!Data/openai_pricing.csv
 outputs/
 output/
 results/

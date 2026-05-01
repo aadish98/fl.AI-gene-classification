@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ import requests
 DIOPT_INPUT_TAXON_FLY = 7227
 DIOPT_TAXON_HUMAN = 9606
 DIOPT_TAXON_MOUSE = 10090
+DEFAULT_ERROR_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 FILTER_ALIASES = {
     "exclude_low_score_2": "exclude_score_less_2",
@@ -32,6 +34,16 @@ def default_cache_dir() -> Path:
     if root:
         return Path(root).expanduser() / "diopt"
     return Path.home() / ".cache" / "flai-gene-classification" / "diopt"
+
+
+def _error_cache_ttl_seconds() -> int:
+    raw = os.environ.get("FLAI_DIOPT_ERROR_CACHE_TTL_SECONDS")
+    if not raw:
+        return DEFAULT_ERROR_CACHE_TTL_SECONDS
+    try:
+        return int(raw)
+    except ValueError:
+        return DEFAULT_ERROR_CACHE_TTL_SECONDS
 
 
 def _clean_text(value: Any) -> str:
@@ -155,36 +167,103 @@ class DIOPTClient:
     ordered set of candidate endpoints and caches the first successful payload.
     """
 
-    def __init__(self, cache_dir: str | Path | None = None, timeout: int = 30):
+    def __init__(
+        self,
+        cache_dir: str | Path | None = None,
+        timeout: int = 30,
+        error_cache_ttl_seconds: int | None = None,
+    ):
         self.cache_dir = Path(cache_dir) if cache_dir else default_cache_dir()
         self.timeout = timeout
+        self.error_cache_ttl_seconds = (
+            error_cache_ttl_seconds
+            if error_cache_ttl_seconds is not None
+            else _error_cache_ttl_seconds()
+        )
+        self._thread_local = threading.local()
+        self._preferred_endpoint_lock = threading.Lock()
+        self._preferred_endpoint_by_key: dict[tuple[int, str], str] = {}
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._thread_local.session = session
+        return session
 
     def _cache_path(self, fbgn_id: str, output_taxon: int, diopt_filter: str) -> Path:
         safe_fbgn = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(fbgn_id).strip())
         safe_filter = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(diopt_filter).strip())
         return self.cache_dir / f"{safe_fbgn}_{int(output_taxon)}_{safe_filter}.json"
 
-    def _candidate_urls(self, fbgn_id: str, output_taxon: int, diopt_filter: str, query_id: str | None = None) -> list[str]:
+    def _candidate_urls(
+        self,
+        fbgn_id: str,
+        output_taxon: int,
+        diopt_filter: str,
+        query_id: str | None = None,
+    ) -> list[tuple[str, str]]:
         base = "https://www.flyrnai.org/tools/diopt/web/diopt_api"
-        fbgn = str(query_id or fbgn_id).strip()
+        entrez_query = str(query_id or fbgn_id).strip()
+        fbgn_query = str(fbgn_id).strip()
         filt = FILTER_ALIASES.get(str(diopt_filter).strip(), str(diopt_filter).strip())
-        return [
-            f"{base}/10/get_orthologs_from_entrez/{DIOPT_INPUT_TAXON_FLY}/{fbgn}/{int(output_taxon)}/{filt}",
-            f"{base}/9/get_orthologs_from_entrez/{DIOPT_INPUT_TAXON_FLY}/{fbgn}/{int(output_taxon)}/{filt}",
-            f"{base}/10/get_orthologs_from_flybase/{DIOPT_INPUT_TAXON_FLY}/{fbgn}/{int(output_taxon)}/{filt}",
-            f"{base}/9/get_orthologs_from_flybase/{DIOPT_INPUT_TAXON_FLY}/{fbgn}/{int(output_taxon)}/{filt}",
-            f"{base}/v10/get_orthologs_from_flybase/{DIOPT_INPUT_TAXON_FLY}/{fbgn}/{int(output_taxon)}/{filt}",
-            f"{base}/v9/get_orthologs_from_flybase/{DIOPT_INPUT_TAXON_FLY}/{fbgn}/{int(output_taxon)}/{filt}",
+        candidates = [
+            (
+                "10_entrez",
+                f"{base}/10/get_orthologs_from_entrez/"
+                f"{DIOPT_INPUT_TAXON_FLY}/{entrez_query}/{int(output_taxon)}/{filt}",
+            ),
+            (
+                "9_entrez",
+                f"{base}/9/get_orthologs_from_entrez/"
+                f"{DIOPT_INPUT_TAXON_FLY}/{entrez_query}/{int(output_taxon)}/{filt}",
+            ),
+            (
+                "10_flybase",
+                f"{base}/10/get_orthologs_from_flybase/"
+                f"{DIOPT_INPUT_TAXON_FLY}/{fbgn_query}/{int(output_taxon)}/{filt}",
+            ),
+            (
+                "9_flybase",
+                f"{base}/9/get_orthologs_from_flybase/"
+                f"{DIOPT_INPUT_TAXON_FLY}/{fbgn_query}/{int(output_taxon)}/{filt}",
+            ),
+            (
+                "v10_flybase",
+                f"{base}/v10/get_orthologs_from_flybase/"
+                f"{DIOPT_INPUT_TAXON_FLY}/{fbgn_query}/{int(output_taxon)}/{filt}",
+            ),
+            (
+                "v9_flybase",
+                f"{base}/v9/get_orthologs_from_flybase/"
+                f"{DIOPT_INPUT_TAXON_FLY}/{fbgn_query}/{int(output_taxon)}/{filt}",
+            ),
         ]
+        preference_key = (int(output_taxon), filt)
+        with self._preferred_endpoint_lock:
+            preferred = self._preferred_endpoint_by_key.get(preference_key)
+        if preferred:
+            candidates.sort(key=lambda item: 0 if item[0] == preferred else 1)
+        return candidates
 
     def _load_cache(self, path: Path) -> Any | None:
         if not path.exists():
             return None
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                cached = json.load(f)
         except Exception:
             return None
+        if isinstance(cached, dict) and cached.get("error"):
+            try:
+                cached_at = float(cached.get("cached_at", 0))
+            except (TypeError, ValueError):
+                cached_at = 0
+            if self.error_cache_ttl_seconds <= 0:
+                return None
+            if not cached_at or time.time() - cached_at > self.error_cache_ttl_seconds:
+                return None
+        return cached
 
     def _save_cache(self, path: Path, payload: Any):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,23 +286,32 @@ class DIOPTClient:
 
         errors: list[str] = []
         for url in self._candidate_urls(fbgn_id, output_taxon, diopt_filter, query_id=query_id):
+            endpoint_id, endpoint_url = url
             try:
-                response = requests.get(url, timeout=self.timeout)
+                response = self._session().get(endpoint_url, timeout=self.timeout)
                 if response.status_code != 200:
-                    errors.append(f"{response.status_code} {url}")
+                    errors.append(f"{response.status_code} {endpoint_url}")
                     continue
                 try:
                     payload = response.json()
                 except Exception:
-                    errors.append(f"non-json {url}")
+                    errors.append(f"non-json {endpoint_url}")
                     continue
+                filt = FILTER_ALIASES.get(str(diopt_filter).strip(), str(diopt_filter).strip())
+                with self._preferred_endpoint_lock:
+                    self._preferred_endpoint_by_key[(int(output_taxon), filt)] = endpoint_id
                 self._save_cache(path, payload)
                 return payload
             except Exception as exc:
-                errors.append(f"{type(exc).__name__}: {url}")
+                errors.append(f"{type(exc).__name__}: {endpoint_url}")
             time.sleep(0.2)
 
-        payload = {"error": "DIOPT lookup failed", "fbgn_id": fbgn_id, "errors": errors}
+        payload = {
+            "error": "DIOPT lookup failed",
+            "fbgn_id": fbgn_id,
+            "errors": errors,
+            "cached_at": time.time(),
+        }
         self._save_cache(path, payload)
         return payload
 
