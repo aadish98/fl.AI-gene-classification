@@ -10,6 +10,7 @@ import argparse
 import gzip
 import os
 import sys
+import uuid
 from glob import glob
 from itertools import combinations
 from pathlib import Path
@@ -75,6 +76,17 @@ symbol_to_name = {
 
 
 DEFAULT_FLYBASE_DATA = resolve_flybase_data_dir()
+
+
+def atomic_write_csv(df: pd.DataFrame, csv_file: str | Path, **to_csv_kwargs):
+    """Write a CSV via a unique temp file, then atomically replace the target."""
+    path = Path(csv_file)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        df.to_csv(tmp_path, **to_csv_kwargs)
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def replace_symbol(gene_series):
@@ -397,7 +409,7 @@ def process_csv_file(csv_file, gene_column, gene_to_fbgnid_main, synonym_to_fbgn
     df = map_gene_ids(df, gene_to_fbgnid_main, synonym_to_fbgnid_map, gene_column + "_new")
     df.fillna("-", inplace=True)
     df.drop(columns=[gene_column + "_new"], inplace=True)
-    df.to_csv(csv_file, index=False, encoding="utf-8-sig")
+    atomic_write_csv(df, csv_file, index=False, encoding="utf-8-sig")
 
     print(f"File saved to {csv_file} with {df.shape[0]} rows.")
 

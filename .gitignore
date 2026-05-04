@@ -35,6 +35,7 @@ output/
 results/
 artifacts/
 .batch_state/
+.flai_cache/
 BATCH_SCRIPTS/
 
 # Jupyter

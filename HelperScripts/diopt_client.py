@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -267,10 +268,13 @@ class DIOPTClient:
 
     def _save_cache(self, path: Path, payload: Any):
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True)
-        tmp.replace(path)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True)
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def fetch_raw(
         self,

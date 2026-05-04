@@ -16,6 +16,7 @@ Output:
 import os
 import sys
 import argparse
+import ast
 import requests
 import time
 import random
@@ -24,10 +25,12 @@ import io
 import subprocess
 import json
 import hashlib
+import uuid
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import pandas as pd
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
@@ -43,10 +46,6 @@ load_dotenv()
 # API Keys
 NCBI_API_KEY = os.getenv("NCBI_API_KEY")
 UNPAYWALL_TOKEN = os.getenv("UNPAYWALL_TOKEN") or "aadish98@gmail.com"
-PUBMED_CACHE_COLUMNS = [
-    "pmid", "pmcid", "title", "abstract", "year", "journal",
-    "authors", "doi", "source", "updated_at"
-]
 
 from metapub import PubMedFetcher
 from openai import OpenAI
@@ -56,17 +55,18 @@ from HelperScripts.flybase_data import (
     SHARED_DATA_ROOT,
     ensure_flybase_data_files,
     resolve_flybase_data_dir,
-    resolve_pubmed_cache_dir,
     using_local_data_root,
 )
 from HelperScripts.gene_models import GeneCatalog, GeneRecord, ReferenceCandidate
 from HelperScripts import human_gene_data, mouse_gene_data
 from HelperScripts.get_orthologs import convert_directory as convert_ortholog_directory
 from HelperScripts.metadata_resolver import normalize_authors, resolve_reference_metadata
+from HelperScripts.pubmed_cache_db import PubMedCacheDB, get_default_pubmed_cache_db
 
-PUBMED_CACHE_DIR = resolve_pubmed_cache_dir()
-PUBMED_CACHE_PATH = PUBMED_CACHE_DIR / "pmid_to_title_abstract.csv"
-FULLTEXT_METHOD_CACHE_PATH = PUBMED_CACHE_DIR / "pmid_to_fulltext_method.csv"
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - fcntl is available on macOS/Linux HPC.
+    fcntl = None
 
 DEFAULT_SUMMARY_MODEL = "gpt-5.4-nano"
 DEFAULT_CLASSIFICATION_MODEL = "gpt-5.4"
@@ -483,39 +483,17 @@ def _resolve_model_pricing(model: str, table: dict[str, ModelPricing]) -> ModelP
 ###############################################################################
 
 _fulltext_method_cache: Dict[str, str] = {}
-_fulltext_method_pending: Dict[str, str] = {}
-_fulltext_cache_loaded = False
 
 _pmid_title_abstract_cache: Dict[str, dict] = {}
-_pmid_title_abstract_pending: Dict[str, dict] = {}
-_pmid_title_abstract_loaded = False
+
+_pubmed_cache_db: PubMedCacheDB | None = None
 
 
-def _load_fulltext_method_cache() -> Dict[str, str]:
-    """Load persistent PMID->method mapping from turbo-server cache."""
-    global _fulltext_cache_loaded, _fulltext_method_cache
-    if _fulltext_cache_loaded:
-        return _fulltext_method_cache
-    try:
-        if FULLTEXT_METHOD_CACHE_PATH.exists():
-            cache_df = pd.read_csv(
-                FULLTEXT_METHOD_CACHE_PATH,
-                dtype={"pmid": str, "method": str}
-            )
-            cache_df["pmid"] = cache_df["pmid"].apply(
-                lambda x: str(x).strip() if pd.notna(x) else ""
-            )
-            cache_df = cache_df[cache_df["pmid"] != ""].copy()
-            if len(cache_df) > 0:
-                _fulltext_method_cache = {
-                    row["pmid"]: str(row["method"]) if pd.notna(row["method"]) else ""
-                    for _, row in cache_df.iterrows()
-                }
-            print(f"  Loaded {len(_fulltext_method_cache)} full-text cache entries")
-    except Exception as e:
-        print(f"  [Warning] Could not load full-text method cache: {e}")
-    _fulltext_cache_loaded = True
-    return _fulltext_method_cache
+def _get_pubmed_cache_db() -> PubMedCacheDB:
+    global _pubmed_cache_db
+    if _pubmed_cache_db is None:
+        _pubmed_cache_db = get_default_pubmed_cache_db()
+    return _pubmed_cache_db
 
 
 def _get_cached_fulltext_method(pmid: str) -> Optional[str]:
@@ -523,83 +501,30 @@ def _get_cached_fulltext_method(pmid: str) -> Optional[str]:
     pmid_clean = str(pmid or "").strip()
     if not pmid_clean:
         return None
-    cache = _load_fulltext_method_cache()
-    method = cache.get(pmid_clean)
+    method = _fulltext_method_cache.get(pmid_clean)
+    if method:
+        return method
+    try:
+        method = _get_pubmed_cache_db().get_fulltext_method(pmid_clean)
+    except Exception as e:
+        print(f"  [Warning] Could not read full-text method cache DB: {e}")
+        method = None
+    if method:
+        _fulltext_method_cache[pmid_clean] = method
     return method if method else None
 
 
 def _set_cached_fulltext_method(pmid: str, method: str):
-    """Store PMID->method in memory and pending-write buffer."""
+    """Store PMID->method in SQLite and the in-process read-through cache."""
     pmid_clean = str(pmid or "").strip()
     method_clean = str(method or "").strip()
     if not pmid_clean or not method_clean:
         return
-    _load_fulltext_method_cache()
     _fulltext_method_cache[pmid_clean] = method_clean
-    _fulltext_method_pending[pmid_clean] = method_clean
-
-
-def _save_fulltext_method_cache_pending():
-    """Append pending PMID->method mappings to shared cache CSV."""
-    if not _fulltext_method_pending:
-        return
     try:
-        rows = [{"pmid": p, "method": m} for p, m in _fulltext_method_pending.items()]
-        new_df = pd.DataFrame(rows)
-        FULLTEXT_METHOD_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        if FULLTEXT_METHOD_CACHE_PATH.exists():
-            new_df.to_csv(FULLTEXT_METHOD_CACHE_PATH, mode="a", header=False, index=False)
-        else:
-            new_df.to_csv(FULLTEXT_METHOD_CACHE_PATH, index=False)
-        print(f"  Saved {len(_fulltext_method_pending)} new full-text cache entries")
-        _fulltext_method_pending.clear()
+        _get_pubmed_cache_db().upsert_fulltext_method(pmid_clean, method_clean, updated_at=_utc_now_iso())
     except Exception as e:
-        print(f"  [Warning] Could not save full-text method cache: {e}")
-
-
-def _load_pmid_title_abstract_cache() -> Dict[str, dict]:
-    """Load persistent PMID metadata cache from turbo-server CSV."""
-    global _pmid_title_abstract_loaded, _pmid_title_abstract_cache
-    if _pmid_title_abstract_loaded:
-        return _pmid_title_abstract_cache
-    try:
-        if PUBMED_CACHE_PATH.exists():
-            cache_df = pd.read_csv(PUBMED_CACHE_PATH, dtype=str, keep_default_na=False)
-            drop_cols = [c for c in cache_df.columns if str(c).startswith("Unnamed")]
-            if drop_cols:
-                cache_df = cache_df.drop(columns=drop_cols)
-            if "pmid" not in cache_df.columns:
-                cache_df = pd.DataFrame(columns=PUBMED_CACHE_COLUMNS)
-            for col in PUBMED_CACHE_COLUMNS:
-                if col not in cache_df.columns:
-                    cache_df[col] = ""
-            cache_df["pmid"] = cache_df["pmid"].apply(
-                lambda x: str(x).strip() if pd.notna(x) else ""
-            )
-            cache_df = cache_df[cache_df["pmid"].str.isdigit()].copy()
-            cache_df = cache_df[PUBMED_CACHE_COLUMNS]
-            if len(cache_df) > 0:
-                for _, row in cache_df.iterrows():
-                    pmid = str(row.get("pmid", "") or "").strip()
-                    if not pmid:
-                        continue
-                    authors_list = normalize_authors(row.get("authors", ""))
-                    _pmid_title_abstract_cache[pmid] = {
-                        "title": str(row.get("title", "") or ""),
-                        "abstract": str(row.get("abstract", "") or ""),
-                        "year": str(row.get("year", "") or ""),
-                        "journal": str(row.get("journal", "") or ""),
-                        "authors": authors_list,
-                        "doi": str(row.get("doi", "") or ""),
-                        "pmcid": str(row.get("pmcid", "") or ""),
-                        "source": str(row.get("source", "") or ""),
-                        "updated_at": str(row.get("updated_at", "") or ""),
-                    }
-            print(f"  Loaded {len(_pmid_title_abstract_cache)} PubMed metadata cache entries")
-    except Exception as e:
-        print(f"  [Warning] Could not load PubMed metadata cache: {e}")
-    _pmid_title_abstract_loaded = True
-    return _pmid_title_abstract_cache
+        print(f"  [Warning] Could not write full-text method cache DB: {e}")
 
 
 def _get_cached_pmid_title_abstract(pmid: str) -> Optional[dict]:
@@ -607,8 +532,15 @@ def _get_cached_pmid_title_abstract(pmid: str) -> Optional[dict]:
     pmid_clean = str(pmid or "").strip()
     if not pmid_clean:
         return None
-    cache = _load_pmid_title_abstract_cache()
-    out = cache.get(pmid_clean)
+    out = _pmid_title_abstract_cache.get(pmid_clean)
+    if not out:
+        try:
+            out = _get_pubmed_cache_db().get_metadata(pmid_clean)
+        except Exception as e:
+            print(f"  [Warning] Could not read PubMed metadata cache DB: {e}")
+            out = None
+    if out:
+        _pmid_title_abstract_cache[pmid_clean] = out
     if not out:
         return None
     return {
@@ -637,7 +569,7 @@ def _set_cached_pmid_title_abstract(
     source: str = "",
     updated_at: str = "",
 ):
-    """Store PMID metadata in memory and pending-write buffer."""
+    """Store PMID metadata in SQLite and the in-process read-through cache."""
     pmid_clean = str(pmid or "").strip()
     if not pmid_clean:
         return
@@ -650,10 +582,9 @@ def _set_cached_pmid_title_abstract(
         "doi": str(doi or ""),
         "pmcid": str(pmcid or ""),
         "source": str(source or ""),
-        "updated_at": str(updated_at or ""),
+        "updated_at": str(updated_at or _utc_now_iso()),
     }
-    _load_pmid_title_abstract_cache()
-    prev = _pmid_title_abstract_cache.get(pmid_clean, {})
+    prev = _get_cached_pmid_title_abstract(pmid_clean) or {}
     merged = {
         "title": entry["title"] or str(prev.get("title", "") or ""),
         "abstract": entry["abstract"] or str(prev.get("abstract", "") or ""),
@@ -666,86 +597,10 @@ def _set_cached_pmid_title_abstract(
         "updated_at": entry["updated_at"] or str(prev.get("updated_at", "") or ""),
     }
     _pmid_title_abstract_cache[pmid_clean] = merged
-    _pmid_title_abstract_pending[pmid_clean] = entry
-
-
-def _save_pmid_title_abstract_cache_pending():
-    """Persist pending PMID metadata updates to shared cache CSV."""
-    if not _pmid_title_abstract_pending:
-        return
     try:
-        _load_pmid_title_abstract_cache()
-        merged_cache: Dict[str, dict] = {}
-
-        if PUBMED_CACHE_PATH.exists():
-            try:
-                disk_df = pd.read_csv(PUBMED_CACHE_PATH, dtype=str, keep_default_na=False)
-                drop_cols = [c for c in disk_df.columns if str(c).startswith("Unnamed")]
-                if drop_cols:
-                    disk_df = disk_df.drop(columns=drop_cols)
-                if "pmid" in disk_df.columns:
-                    for col in PUBMED_CACHE_COLUMNS:
-                        if col not in disk_df.columns:
-                            disk_df[col] = ""
-                    disk_df = disk_df[PUBMED_CACHE_COLUMNS]
-                    for _, row in disk_df.iterrows():
-                        pmid = str(row.get("pmid", "") or "").strip()
-                        if not pmid.isdigit():
-                            continue
-                        merged_cache[pmid] = {
-                            "pmcid": str(row.get("pmcid", "") or ""),
-                            "title": str(row.get("title", "") or ""),
-                            "abstract": str(row.get("abstract", "") or ""),
-                            "year": str(row.get("year", "") or ""),
-                            "journal": str(row.get("journal", "") or ""),
-                            "authors": normalize_authors(row.get("authors", "")),
-                            "doi": str(row.get("doi", "") or ""),
-                            "source": str(row.get("source", "") or ""),
-                            "updated_at": str(row.get("updated_at", "") or ""),
-                        }
-            except Exception:
-                # Keep best-effort behavior even if disk cache is malformed.
-                pass
-
-        for pmid, meta in _pmid_title_abstract_cache.items():
-            prior = merged_cache.get(pmid, {})
-            merged_cache[pmid] = {
-                "pmcid": str(meta.get("pmcid", "") or prior.get("pmcid", "")),
-                "title": str(meta.get("title", "") or prior.get("title", "")),
-                "abstract": str(meta.get("abstract", "") or prior.get("abstract", "")),
-                "year": str(meta.get("year", "") or prior.get("year", "")),
-                "journal": str(meta.get("journal", "") or prior.get("journal", "")),
-                "authors": normalize_authors(meta.get("authors", []) or prior.get("authors", [])),
-                "doi": str(meta.get("doi", "") or prior.get("doi", "")),
-                "source": str(meta.get("source", "") or prior.get("source", "")),
-                "updated_at": str(meta.get("updated_at", "") or prior.get("updated_at", "")),
-            }
-
-        rows = []
-        for pmid, meta in merged_cache.items():
-            rows.append({
-                "pmid": str(pmid),
-                "pmcid": str(meta.get("pmcid", "") or ""),
-                "title": str(meta.get("title", "") or ""),
-                "abstract": str(meta.get("abstract", "") or ""),
-                "year": str(meta.get("year", "") or ""),
-                "journal": str(meta.get("journal", "") or ""),
-                "authors": "; ".join(normalize_authors(meta.get("authors", []))),
-                "doi": str(meta.get("doi", "") or ""),
-                "source": str(meta.get("source", "") or ""),
-                "updated_at": str(meta.get("updated_at", "") or ""),
-            })
-        out_df = pd.DataFrame(rows, columns=PUBMED_CACHE_COLUMNS)
-        out_df = out_df.sort_values(by=["pmid"], ascending=True).reset_index(drop=True)
-        PUBMED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        out_df.to_csv(PUBMED_CACHE_PATH, index=False)
-        print(
-            f"  Saved {len(_pmid_title_abstract_pending)} pending updates "
-            f"({len(out_df)} total PubMed metadata rows)"
-        )
-        _pmid_title_abstract_pending.clear()
+        _get_pubmed_cache_db().upsert_metadata({"pmid": pmid_clean, **merged})
     except Exception as e:
-        print(f"  [Warning] Could not save PubMed metadata cache: {e}")
+        print(f"  [Warning] Could not write PubMed metadata cache DB: {e}")
 
 
 def find_latest_tsv(directory: Path, pattern: str) -> Path:
@@ -3694,10 +3549,13 @@ def generate_excel_output(gene_hits, all_summaries, validated, output_path, gene
 def _json_dump(path: Path, payload: dict):
     """Atomically write JSON payload to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True)
-    os.replace(tmp_path, path)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True)
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _json_load(path: Path, default: Any):
@@ -3738,6 +3596,24 @@ def _make_input_fingerprint(gene_ids: list[str], keywords_list: list[str], refer
 
 def _get_batch_root(input_directory: str) -> Path:
     return Path(input_directory) / BATCH_STATE_DIRNAME
+
+
+@contextmanager
+def _file_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a", encoding="utf-8") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _run_store_path(input_directory: str, species: str = "fly") -> Path:
+    safe_species = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(species or "fly").strip() or "fly")
+    return _get_batch_root(input_directory) / f"run_store_{safe_species}.json"
 
 
 def _get_csv_state_dir(input_directory: str, csv_path: str, species: str = "fly") -> Path:
@@ -3859,22 +3735,41 @@ def _merge_gene_records(records: list[dict]) -> tuple[dict, list[dict], dict[str
     return gene_hits, all_summaries, validated
 
 
-def _load_run_store(input_directory: str) -> dict:
-    run_store_path = _get_batch_root(input_directory) / RUN_STORE_FILENAME
-    store = _json_load(run_store_path, default={"version": CACHE_SCHEMA_VERSION, "genes": {}})
+def _load_run_store(input_directory: str, species: str = "fly") -> dict:
+    run_store_path = _run_store_path(input_directory, species)
+    legacy_path = _get_batch_root(input_directory) / RUN_STORE_FILENAME
+    default = {"version": CACHE_SCHEMA_VERSION, "species": str(species or "fly"), "genes": {}}
+    store = _json_load(run_store_path, default=None)
+    if store is None and legacy_path.exists():
+        store = _json_load(legacy_path, default=default)
+    if store is None:
+        store = default
     if not isinstance(store, dict):
-        return {"version": CACHE_SCHEMA_VERSION, "genes": {}}
+        return dict(default)
     if int(store.get("version", 0) or 0) != CACHE_SCHEMA_VERSION:
-        return {"version": CACHE_SCHEMA_VERSION, "genes": {}}
+        return dict(default)
     if "genes" not in store or not isinstance(store["genes"], dict):
         store["genes"] = {}
     store["version"] = CACHE_SCHEMA_VERSION
+    store["species"] = str(species or "fly")
     return store
 
 
-def _save_run_store(input_directory: str, run_store: dict):
-    run_store_path = _get_batch_root(input_directory) / RUN_STORE_FILENAME
-    _json_dump(run_store_path, run_store)
+def _save_run_store(input_directory: str, run_store: dict, species: str = "fly"):
+    run_store_path = _run_store_path(input_directory, species)
+    lock_path = run_store_path.with_suffix(run_store_path.suffix + ".lock")
+    with _file_lock(lock_path):
+        disk_store = _json_load(run_store_path, default={"version": CACHE_SCHEMA_VERSION, "species": species, "genes": {}})
+        if not isinstance(disk_store, dict) or int(disk_store.get("version", 0) or 0) != CACHE_SCHEMA_VERSION:
+            disk_store = {"version": CACHE_SCHEMA_VERSION, "species": species, "genes": {}}
+        if "genes" not in disk_store or not isinstance(disk_store["genes"], dict):
+            disk_store["genes"] = {}
+        disk_store["genes"].update(run_store.get("genes", {}) or {})
+        disk_store["version"] = CACHE_SCHEMA_VERSION
+        disk_store["species"] = str(species or "fly")
+        _json_dump(run_store_path, disk_store)
+        run_store.clear()
+        run_store.update(disk_store)
 
 
 def _input_id_column_for_adapter(adapter: SpeciesAdapter) -> str:
@@ -4099,7 +3994,7 @@ def process_csv_file(
                         species=adapter.key,
                     )
                     run_store.setdefault("genes", {})[store_key] = record
-                _save_run_store(input_directory, run_store)
+                _save_run_store(input_directory, run_store, adapter.key)
                 log_step("Saved run-store cache", f"{len(run_store.get('genes', {}))} cached gene entries", indent=1)
 
             record_by_gene_id: dict[str, dict] = {}
@@ -4337,7 +4232,159 @@ def run_fbgnid_conversion(
         return False
 
 
-def main():
+def _source_csv_files(input_directory: str) -> list[str]:
+    return [
+        os.path.join(input_directory, f)
+        for f in os.listdir(input_directory)
+        if (
+            f.endswith(".csv")
+            and not f.endswith("_classification.csv")
+            and not f.endswith("_human.csv")
+            and not f.endswith("_mouse.csv")
+        )
+    ]
+
+
+def validate_source_csvs(input_directory: str, input_gene_col: str = "ext_gene") -> bool:
+    """Validate prepared source CSVs before read-only classification stages."""
+    csv_files = _source_csv_files(input_directory)
+    if not csv_files:
+        print(f"No source CSV files found in {input_directory}")
+        return False
+    ok = True
+    for csv_path in sorted(csv_files):
+        try:
+            df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+        except Exception as e:
+            print(f"Error reading prepared CSV {csv_path}: {e}")
+            ok = False
+            continue
+        missing = [col for col in (input_gene_col, "flybase_gene_id") if col not in df.columns]
+        if missing:
+            print(f"Prepared CSV missing required column(s) {missing}: {csv_path}")
+            ok = False
+            continue
+        fbgn = df["flybase_gene_id"].astype(str).str.strip()
+        valid = fbgn.str.startswith("FBgn", na=False)
+        allowed_unmapped = fbgn.isin(["", "-", "nan", "NaN", "None", "none"])
+        invalid = ~(valid | allowed_unmapped)
+        if invalid.any():
+            print(f"Prepared CSV has {int(invalid.sum())} invalid flybase_gene_id values: {csv_path}")
+            ok = False
+        print(
+            f"Validated {Path(csv_path).name}: rows={len(df)}, "
+            f"valid_fbgn={int(valid.sum())}, unmapped={int(allowed_unmapped.sum())}"
+        )
+    return ok
+
+
+def _parse_config_value(raw: str) -> Any:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        return ast.literal_eval(text)
+    except Exception:
+        pass
+    if "," in text:
+        return [part.strip() for part in text.split(",") if part.strip()]
+    return text
+
+
+def _load_config(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {}
+    config_path = Path(path).expanduser()
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    if config_path.suffix.lower() == ".json":
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    config: dict[str, Any] = {}
+    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        config[key.strip().replace("-", "_")] = _parse_config_value(value)
+    return config
+
+
+def _apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    config = _load_config(getattr(args, "config", "") or "")
+
+    def pick(name: str, default: Any) -> Any:
+        value = getattr(args, name, None)
+        if value not in (None, ""):
+            return value
+        return config.get(name, default)
+
+    args.keywords = pick("keywords", "")
+    if isinstance(args.keywords, (list, tuple)):
+        args.keywords = ",".join(str(item).strip() for item in args.keywords if str(item).strip())
+    args.reference_limit = int(pick("reference_limit", 500))
+    args.input_gene_col = str(pick("input_gene_col", "ext_gene"))
+    args.diopt_filter = str(pick("diopt_filter", "exclude_low_score_2"))
+    args.diopt_workers = int(pick("diopt_workers", 8))
+    args.diopt_cache_dir = str(pick("diopt_cache_dir", os.environ.get("FLAI_DIOPT_CACHE_DIR", "")))
+    args.flybase_data_dir = str(pick("flybase_data_dir", ""))
+    args.human_data_dir = str(pick("human_data_dir", ""))
+    args.mouse_data_dir = str(pick("mouse_data_dir", ""))
+    return args
+
+
+def _add_common_args(parser: argparse.ArgumentParser, *, include_species: bool = False):
+    parser.add_argument("input_directory", help="Directory containing input CSV files")
+    parser.add_argument("--config", default="", help="Optional JSON or simple YAML config file.")
+    if include_species:
+        parser.add_argument("--species", choices=["fly", "human", "mouse"], default="fly")
+    parser.add_argument("--keywords", "-k", default=None)
+    parser.add_argument("--reference-limit", "-r", type=int, default=None)
+    parser.add_argument("--input-gene-col", default=None)
+    parser.add_argument("--flybase-data-dir", default=None)
+    parser.add_argument("--force-all", action="store_true")
+    parser.add_argument("--diopt-filter", default=None)
+    parser.add_argument("--human-data-dir", default=None)
+    parser.add_argument("--mouse-data-dir", default=None)
+    parser.add_argument("--refresh-human-data", action="store_true")
+    parser.add_argument("--refresh-mouse-data", action="store_true")
+    parser.add_argument("--diopt-cache-dir", default=None)
+    parser.add_argument("--diopt-workers", type=int, default=None)
+
+
+def _parse_new_cli(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="fl.AI gene classification pipeline",
+    )
+    subparsers = parser.add_subparsers(dest="action", required=True)
+    prepare = subparsers.add_parser("prepare", help="Run FBgn conversion and validate source CSVs.")
+    _add_common_args(prepare)
+    classify = subparsers.add_parser("classify", help="Classify prepared source CSVs.")
+    _add_common_args(classify, include_species=True)
+    estimate = subparsers.add_parser("estimate", help="Estimate cost/work for prepared source CSVs.")
+    _add_common_args(estimate, include_species=True)
+    cache = subparsers.add_parser("cache", help="Cache maintenance commands.")
+    cache_subparsers = cache.add_subparsers(dest="cache_action", required=True)
+    validate = cache_subparsers.add_parser("validate", help="Validate/migrate PubMed cache into SQLite.")
+    validate.add_argument("--metadata-csv", default="")
+    validate.add_argument("--fulltext-csv", default="")
+    validate.add_argument("--db-path", default="")
+    validate.add_argument("--apply", action="store_true")
+    validate.add_argument("--fail-on-invalid", action="store_true")
+    validate.add_argument("--report-path", default="")
+
+    args = parser.parse_args(argv)
+    if args.action == "cache":
+        return args
+    args = _apply_config_defaults(args)
+    args.soft_run = args.action == "estimate"
+    args.prepare_only = args.action == "prepare"
+    args.skip_fbgn_conversion = args.action in {"classify", "estimate"}
+    species = getattr(args, "species", "fly")
+    args.orthologs = "none" if species == "fly" else species
+    return args
+
+
+def _parse_legacy_cli(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Fly gene classification pipeline - converts input symbols "
@@ -4348,20 +4395,21 @@ def main():
         "input_directory",
         help="Directory containing input CSV files for FBgn conversion and classification"
     )
+    parser.add_argument("--config", default="", help="Optional JSON or simple YAML config file.")
     parser.add_argument(
         "--keywords", "-k",
-        default="",
+        default=None,
         help="Comma-separated list of classification keywords (e.g., 'circadian,sleep,rhythm')"
     )
     parser.add_argument(
         "--reference-limit", "-r",
         type=int,
-        default=500,
+        default=None,
         help="Maximum number of references to consider per gene (default: 500)"
     )
     parser.add_argument(
         "--input-gene-col",
-        default="ext_gene",
+        default=None,
         help="Input gene symbol column for FBgnID conversion (default: ext_gene)."
     )
     parser.add_argument(
@@ -4373,6 +4421,16 @@ def main():
         "--force-all",
         action="store_true",
         help="Ignore checkpoint/resume state and reprocess all genes from scratch."
+    )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Run FBgn conversion and source CSV validation, then exit."
+    )
+    parser.add_argument(
+        "--skip-fbgn-conversion",
+        action="store_true",
+        help="Validate existing flybase_gene_id values and skip source CSV mutation."
     )
     parser.add_argument(
         "--soft-run",
@@ -4390,7 +4448,7 @@ def main():
     )
     parser.add_argument(
         "--diopt-filter",
-        default="exclude_low_score_2",
+        default=None,
         help="DIOPT filter to use for ortholog lookup (default: exclude_low_score_2)."
     )
     parser.add_argument(
@@ -4415,17 +4473,26 @@ def main():
     )
     parser.add_argument(
         "--diopt-cache-dir",
-        default="",
+        default=None,
         help="Optional cache directory for DIOPT API responses."
     )
     parser.add_argument(
         "--diopt-workers",
         type=int,
-        default=8,
+        default=None,
         help="Concurrent DIOPT lookup workers for ortholog mapping (default: 8)."
     )
-    
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    print(
+        "[Deprecation warning] The flat CLI is still supported for now, but the safer "
+        "subcommands are: prepare, classify, estimate, and cache validate."
+    )
+    args = _apply_config_defaults(args)
+    args.action = "prepare" if args.prepare_only else ("estimate" if args.soft_run else "classify")
+    return args
+
+
+def _execute_pipeline(args: argparse.Namespace) -> int:
 
     global FLYBASE_DATA
     FLYBASE_DATA = resolve_flybase_data_dir(args.flybase_data_dir or None)
@@ -4434,7 +4501,7 @@ def main():
     log_step("Validating input directory", args.input_directory)
     if not os.path.isdir(args.input_directory):
         print(f"Error: '{args.input_directory}' is not a valid directory")
-        sys.exit(1)
+        return 1
     
     if using_local_data_root() and not args.flybase_data_dir and not os.environ.get("FLYBASE_DATA_DIR"):
         print(f"Shared lab data root is not accessible: {SHARED_DATA_ROOT}")
@@ -4451,7 +4518,7 @@ def main():
         print("Could not retrieve:")
         for requirement in missing_flybase:
             print(f"  - {requirement['label']}: {requirement['url']}")
-        sys.exit(1)
+        return 1
     
     # Parse keywords
     keywords_list = [k.strip() for k in args.keywords.split(",") if k.strip()]
@@ -4464,15 +4531,32 @@ def main():
     print(f"Reference limit: {args.reference_limit}")
     print(f"Batch size: {BATCH_SIZE} (automatic)")
     print(f"FlyBase data: {FLYBASE_DATA}")
-    print(f"PubMed cache: {PUBMED_CACHE_DIR}")
+    pubmed_db = _get_pubmed_cache_db()
+    print(f"PubMed cache DB: {pubmed_db.path} ({pubmed_db.source})")
     print(f"Force all: {'yes' if args.force_all else 'no'}")
     print(f"Soft run: {'yes' if args.soft_run else 'no'}")
     print(f"Ortholog mode: {args.orthologs}")
     print(f"DIOPT filter: {args.diopt_filter}")
     if args.orthologs != "none":
         print(f"DIOPT workers: {max(1, args.diopt_workers)}")
-    print("Run FBgnID conversion: yes (default)")
+    print(f"Run FBgnID conversion: {'no' if args.skip_fbgn_conversion else 'yes'}")
     print(f"FBgn conversion input gene column: {args.input_gene_col}")
+
+    # Step 0: convert input symbols to FBgn IDs, or validate an already prepared folder.
+    if args.skip_fbgn_conversion:
+        log_step("Validating prepared source CSVs")
+        ok = validate_source_csvs(args.input_directory, args.input_gene_col)
+    else:
+        log_step("Converting input gene symbols to FBgn IDs")
+        ok = run_fbgnid_conversion(args.input_directory, args.input_gene_col, FLYBASE_DATA)
+        if ok:
+            ok = validate_source_csvs(args.input_directory, args.input_gene_col)
+    if not ok:
+        print("Error: input preparation/validation failed; aborting.")
+        return 1
+    if args.prepare_only:
+        print("Prepare-only mode complete.")
+        return 0
 
     # Fail fast on API misconfiguration so runs do not silently produce empty outputs.
     summary_model = _get_summary_model()
@@ -4486,7 +4570,7 @@ def main():
             classification_pricing = _resolve_model_pricing(classification_model, pricing_table)
         except Exception as e:
             print(f"Error: could not prepare OpenAI pricing table: {e}")
-            sys.exit(1)
+            return 1
         soft_run_estimate = SoftRunEstimate(
             summary_model=summary_model,
             classification_model=classification_model,
@@ -4501,7 +4585,7 @@ def main():
             _get_openai_client()
         except Exception as e:
             print(f"Error: OpenAI API setup invalid: {e}")
-            sys.exit(1)
+            return 1
         print(f"OpenAI summary model: {summary_model}")
         print(f"OpenAI classification model: {classification_model}")
         print(
@@ -4509,13 +4593,6 @@ def main():
             f"summary={_get_reasoning_effort('OPENAI_SUMMARY_REASONING_EFFORT', DEFAULT_SUMMARY_REASONING_EFFORT)}, "
             f"classification={_get_reasoning_effort('OPENAI_CLASSIFICATION_REASONING_EFFORT', DEFAULT_CLASSIFICATION_REASONING_EFFORT)}"
         )
-
-    # Step 0: convert input symbols to FBgn IDs.
-    log_step("Converting input gene symbols to FBgn IDs")
-    ok = run_fbgnid_conversion(args.input_directory, args.input_gene_col, FLYBASE_DATA)
-    if not ok:
-        print("Error: FBgnID conversion failed; aborting.")
-        sys.exit(1)
 
     log_step("Configuring species data caches")
     human_gene_data.configure(args.human_data_dir or None, refresh=args.refresh_human_data)
@@ -4540,25 +4617,15 @@ def main():
             print(f"Error creating {args.orthologs} ortholog CSVs: {e}")
             import traceback
             traceback.print_exc()
-            sys.exit(1)
+            return 1
         csv_files = [str(path) for path in generated]
     else:
         log_step("Finding source CSV files")
-        # Find source CSV files, excluding generated ortholog and output files.
-        csv_files = [
-            os.path.join(args.input_directory, f)
-            for f in os.listdir(args.input_directory)
-            if (
-                f.endswith('.csv')
-                and not f.endswith('_classification.csv')
-                and not f.endswith('_human.csv')
-                and not f.endswith('_mouse.csv')
-            )
-        ]
+        csv_files = _source_csv_files(args.input_directory)
     
     if not csv_files:
         print(f"\nNo CSV files found in {args.input_directory}")
-        sys.exit(1)
+        return 1
     
     print(f"\nFound {len(csv_files)} CSV files to process")
     batch_root = _get_batch_root(args.input_directory)
@@ -4567,8 +4634,8 @@ def main():
     else:
         log_step("Preparing batch state directory", str(batch_root))
         batch_root.mkdir(parents=True, exist_ok=True)
-    log_step("Loading run-store cache")
-    run_store = _load_run_store(args.input_directory)
+    log_step("Loading run-store cache", adapter.key)
+    run_store = _load_run_store(args.input_directory, adapter.key)
     
     # Process each file
     success_count = 0
@@ -4591,7 +4658,7 @@ def main():
                     success_count += 1
                 else:
                     print(f"\nError estimating {csv_path}; exiting early.")
-                    sys.exit(1)
+                    return 1
             else:
                 if process_csv_file(
                     csv_path,
@@ -4607,18 +4674,12 @@ def main():
                     success_count += 1
                 else:
                     print(f"\nError processing {csv_path}; exiting early to preserve checkpoints.")
-                    sys.exit(1)
+                    return 1
         except Exception as e:
             print(f"\nError processing {csv_path}: {e}")
             import traceback
             traceback.print_exc()
-            sys.exit(1)
-    
-    # Persist shared caches for future runs.
-    log_step("Saving metadata caches")
-    _save_pmid_title_abstract_cache_pending()
-    if not args.soft_run:
-        _save_fulltext_method_cache_pending()
+            return 1
 
     if args.soft_run:
         _print_soft_run_report(soft_run_estimate)  # type: ignore[arg-type]
@@ -4627,7 +4688,25 @@ def main():
     action = "estimated" if args.soft_run else "processed"
     print(f"Complete! Successfully {action} {success_count}/{len(csv_files)} files")
     print(f"{'='*70}")
+    return 0
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:2] == ["cache", "validate"]:
+        from HelperScripts.validate_pubmed_cache import main as validate_cache_main
+
+        return validate_cache_main(argv[2:])
+    if argv and argv[0] in {"prepare", "classify", "estimate", "cache"}:
+        args = _parse_new_cli(argv)
+        if args.action == "cache":
+            from HelperScripts.validate_pubmed_cache import main as validate_cache_main
+
+            return validate_cache_main(argv[2:])
+        return _execute_pipeline(args)
+    args = _parse_legacy_cli(argv)
+    return _execute_pipeline(args)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

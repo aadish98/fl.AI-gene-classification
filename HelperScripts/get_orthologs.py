@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import os
 import re
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -43,6 +45,16 @@ TARGETS = {
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _atomic_write_csv(df: pd.DataFrame, path: Path, **to_csv_kwargs) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        df.to_csv(tmp_path, **to_csv_kwargs)
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def load_fbgn_to_primary_symbol(flybase_data_dir: Path) -> dict[str, str]:
@@ -263,8 +275,7 @@ def convert_csv(
         "diopt_supporting_algorithms",
         "status",
     ]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows, columns=columns).to_csv(out_path, index=False, encoding="utf-8-sig")
+    _atomic_write_csv(pd.DataFrame(rows, columns=columns), out_path, index=False, encoding="utf-8-sig")
     return out_path
 
 

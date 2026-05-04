@@ -1,0 +1,7 @@
+{
+  "keywords": ["sleep", "circadian"],
+  "reference_limit": 250,
+  "input_gene_col": "ext_gene",
+  "diopt_filter": "exclude_low_score_2",
+  "diopt_workers": 8
+}

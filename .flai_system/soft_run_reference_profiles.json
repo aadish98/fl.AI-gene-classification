@@ -1,40 +1,42 @@
 {
   "profiles": [
     {
-      "summary_model": "gpt-5.4-nano",
-      "classification_model": "gpt-5.4",
-      "label": "Tx-Omics conserved-small fly-to-human/mouse calibration",
-      "source": "Data/Tx-Omics_Conserved-Small",
-      "reference_limit": 50,
-      "observed_model_requests": 389,
-      "observed_references": 147,
-      "observed_gpt_classifications": 26,
-      "summary_requests_per_reference": 2.4693877551020407,
-      "summary_input_tokens_per_reference": 16095.238095238095,
-      "summary_output_tokens_per_reference": 615.8303030303031,
-      "classification_requests_per_gene": 1.0,
       "classification_input_tokens_per_gene": 790.7230769230769,
+      "classification_model": "gpt-5.4",
       "classification_output_tokens_per_gene": 287.8055944055945,
+      "classification_requests_per_gene": 1.0,
+      "label": "Tx-Omics conserved-small fly-to-human/mouse calibration",
       "notes": [
         "Calibrated from the saved run-store, not from the filtered workbook sheets.",
         "Output-token split was inferred from combined output tokens, total cost, and model prices for the original run."
-      ]
+      ],
+      "observed_gpt_classifications": 26,
+      "observed_model_requests": 389,
+      "observed_references": 147,
+      "reference_limit": 50,
+      "source": "Data/Tx-Omics_Conserved-Small",
+      "summary_input_tokens_per_reference": 16095.238095238095,
+      "summary_model": "gpt-5.4-nano",
+      "summary_output_tokens_per_reference": 615.8303030303031,
+      "summary_requests_per_reference": 2.4693877551020407
     }
   ],
   "species_keyword_pass_rates": {
     "human": {
-      "calibration_limited_references": 800,
-      "calibration_metadata_keyword_matches": 84,
-      "keyword_pass_rate": 0.105,
-      "reference_limit": 50,
-      "source": "Data/Tx-Omics_Conserved-Small"
+      "calibration_limited_references": 23564,
+      "calibration_metadata_keyword_matches": 5504,
+      "keyword_pass_rate": 0.23357664233576642,
+      "reference_limit": 150,
+      "source": "/nfs/turbo/umms-rallada/UM Lab Users/Aadish/fl.AI-gene-classification/Data/Tx-Omics-Conserved-Medium/Subset2-M/Human/Wake gene list FC1 Table_human.csv",
+      "updated_at_utc": "2026-05-02T08:42:22Z"
     },
     "mouse": {
-      "calibration_limited_references": 800,
-      "calibration_metadata_keyword_matches": 63,
-      "keyword_pass_rate": 0.07875,
-      "reference_limit": 50,
-      "source": "Data/Tx-Omics_Conserved-Small"
+      "calibration_limited_references": 16313,
+      "calibration_metadata_keyword_matches": 1093,
+      "keyword_pass_rate": 0.06700177772328818,
+      "reference_limit": 150,
+      "source": "/nfs/turbo/umms-rallada/UM Lab Users/Aadish/fl.AI-gene-classification/Data/Tx-Omics-Conserved-Medium/Subset2-M/Mouse/Wake gene list FC1 Table_mouse.csv",
+      "updated_at_utc": "2026-05-02T01:41:56Z"
     }
   }
 }

@@ -61,40 +61,58 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Run: Fly Literature
+## Run: Prepared, Parallel-Safe Workflow
 
 ```bash
-python flai_gene_classification.py /path/to/input_dir \
+python flai_gene_classification.py prepare /path/to/input_dir \
   --keywords "sleep,circadian,synapse" \
   --reference-limit 500 \
   --input-gene-col ext_gene
 ```
 
-This preserves the original fly workflow: input fly symbols -> `FBgn` IDs -> fly literature -> `<input_name>_classification.xlsx`.
+This single-writer preparation step converts input fly symbols to `FBgn` IDs and validates the source CSVs. After preparation, classification jobs can skip source CSV mutation.
 
-## Run: Fly to Human Orthologs
-
-```bash
-python flai_gene_classification.py /path/to/input_dir \
-  --orthologs human \
-  --keywords "sleep,circadian,synapse" \
-  --reference-limit 500 \
-  --input-gene-col ext_gene
-```
-
-The pipeline writes sibling `<input_name>_human.csv` files containing the fly-to-human DIOPT crosswalk, then classifies each unique human ortholog and exports `<input_name>_human_classification.xlsx`.
-
-## Run: Fly to Mouse Orthologs
+### Fly Literature
 
 ```bash
-python flai_gene_classification.py /path/to/input_dir \
-  --orthologs mouse \
+python flai_gene_classification.py classify /path/to/input_dir \
+  --species fly \
   --keywords "sleep,circadian,synapse" \
-  --reference-limit 500 \
-  --input-gene-col ext_gene
+  --reference-limit 500
 ```
 
-The pipeline writes sibling `<input_name>_mouse.csv` files containing the fly-to-mouse DIOPT crosswalk, then classifies each unique mouse ortholog and exports `<input_name>_mouse_classification.xlsx`.
+This classifies prepared fly inputs and writes `<input_name>_classification.xlsx`.
+
+### Fly to Human Orthologs
+
+```bash
+python flai_gene_classification.py classify /path/to/input_dir \
+  --species human \
+  --keywords "sleep,circadian,synapse" \
+  --reference-limit 500
+```
+
+The pipeline writes `Human/<input_name>_human.csv` files containing the fly-to-human DIOPT crosswalk, then classifies each unique human ortholog and exports `Human/<input_name>_human_classification.xlsx`.
+
+### Fly to Mouse Orthologs
+
+```bash
+python flai_gene_classification.py classify /path/to/input_dir \
+  --species mouse \
+  --keywords "sleep,circadian,synapse" \
+  --reference-limit 500
+```
+
+The pipeline writes `Mouse/<input_name>_mouse.csv` files containing the fly-to-mouse DIOPT crosswalk, then classifies each unique mouse ortholog and exports `Mouse/<input_name>_mouse_classification.xlsx`.
+
+### Estimate and Cache Maintenance
+
+```bash
+python flai_gene_classification.py estimate /path/to/input_dir --species human
+python flai_gene_classification.py cache validate --apply
+```
+
+The PubMed metadata cache now uses SQLite. It prefers `FLAI_PUBMED_CACHE_DB`, then the shared Turbo PubMed cache directory, then a local gitignored `.flai_cache/pubmed_cache.sqlite` fallback.
 
 ## Ortholog Defaults
 
