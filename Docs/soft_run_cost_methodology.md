@@ -43,6 +43,12 @@ $$
 
 This cap prevents a single gene with many metadata matches from dominating the estimate.
 
+Reference collection uses the same organism-scoped source adapters as a real
+run. In particular, Europe PMC is filtered with structured `ORGANISM` / `MESH`
+clauses for fly, human, and mouse before the candidate count is estimated, so
+the soft-run does not budget for off-organism EPMC-only references that the
+real pipeline would no longer summarize.
+
 ## Keyword-Pass Calibration
 
 Species keyword-pass rates live in `.flai_system/soft_run_reference_profiles.json` under `species_keyword_pass_rates`. If no species rate exists, soft-run falls back to `1.0`, which makes the reference estimate a candidate-count upper bound.
@@ -78,6 +84,11 @@ Soft-run uses four constants:
 - $\tau^{\text{out}}_{\text{cls}}$: capped output tokens per gene classification.
 
 Output uses the configured generation cap rather than an average because reasoning tokens and visible output tokens are only known after a real response. The capped output estimate is therefore an upper-bound component, not expected spend.
+
+The live summary/classification prompts include target-organism context and a
+`species_specific` summary field. This adds a small fixed prompt overhead, but
+`SHARED_PROMPT_OVERHEAD_WORDS=800` remains the runtime chunk-budget reserve and
+the fixed soft-run constants above remain conservative for budgeting.
 
 ## Empirical Reference Averages
 

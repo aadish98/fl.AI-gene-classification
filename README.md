@@ -19,6 +19,7 @@ All non-code documentation lives under [`Docs/`](Docs/):
 - Collect candidate references from species-specific sources.
 - Merge and deduplicate references, then rank by source consensus and recency.
 - Fetch metadata and keep references whose title/abstract matches your keywords.
+- Generate organism-strict LLM summaries and classifications: fly, human, and mouse runs each restrict evidence to the selected organism's gene and skip references that only describe another organism's ortholog/paralog/homolog.
 - Pull full text when possible, summarize gene-specific evidence, classify into keyword categories, and export one Excel per input CSV.
 
 ## Example End-To-End Flow
@@ -129,7 +130,7 @@ Fly mode uses:
 
 - FlyBase local reference tables
 - PubMed search scoped to Drosophila / fruit fly
-- Europe PMC search scoped to Drosophila / fruit fly
+- Europe PMC search scoped to `Drosophila melanogaster` via structured organism/MeSH filters
 
 Human mode uses:
 
@@ -137,7 +138,7 @@ Human mode uses:
 - NCBI `gene2pubmed` filtered to `tax_id == 9606`
 - NCBI GeneRIF filtered to `tax_id == 9606`
 - UniProt Swiss-Prot reviewed human entries
-- PubMed and Europe PMC searches scoped to Homo sapiens
+- PubMed and Europe PMC searches scoped to `Homo sapiens`
 
 Mouse mode uses:
 
@@ -145,7 +146,7 @@ Mouse mode uses:
 - NCBI `gene2pubmed` filtered to `tax_id == 10090`
 - NCBI GeneRIF filtered to `tax_id == 10090`
 - UniProt Swiss-Prot reviewed mouse entries
-- PubMed and Europe PMC searches scoped to Mus musculus
+- PubMed and Europe PMC searches scoped to `Mus musculus`
 
 ## Output Workbook
 

@@ -25,6 +25,7 @@ Usage:
                                                    [--output summary.xlsx]
                                                    [--human-dir PATH]
                                                    [--mouse-dir PATH]
+                                                   [--ortholog {human,mouse}]
 """
 
 from __future__ import annotations
@@ -295,14 +296,17 @@ def build_summary(
     input_gene_col: str,
     human_dir: Path | None,
     mouse_dir: Path | None,
+    species_keys: list[str] | None = None,
 ) -> list[GeneSetSummary]:
     originals = find_original_csvs(input_dir)
     if not originals:
         return []
 
+    species_keys = species_keys or list(SPECIES_CONFIG.keys())
+    overrides = {"human": human_dir, "mouse": mouse_dir}
     resolved = {
-        "human": resolve_species_dir(input_dir, SPECIES_CONFIG["human"], human_dir),
-        "mouse": resolve_species_dir(input_dir, SPECIES_CONFIG["mouse"], mouse_dir),
+        key: resolve_species_dir(input_dir, SPECIES_CONFIG[key], overrides.get(key))
+        for key in species_keys
     }
 
     results: list[GeneSetSummary] = []
@@ -310,9 +314,9 @@ def build_summary(
         stem = csv_path.stem
         gene_set = GeneSetSummary(gene_set=stem, original_path=csv_path)
         gene_set.fly_unique, gene_set.fly_notes = count_unique_fly_genes(csv_path, input_gene_col)
-        for species_key, cfg in SPECIES_CONFIG.items():
+        for species_key in species_keys:
             gene_set.species[species_key] = summarize_species_for_file(
-                stem, cfg, resolved[species_key]
+                stem, SPECIES_CONFIG[species_key], resolved[species_key]
             )
         results.append(gene_set)
     return results
@@ -328,10 +332,14 @@ def _format_bucket_breakdown(species: SpeciesSummary) -> str:
     return "\n".join(f"{bucket}: {count}" for bucket, count in sorted_buckets)
 
 
-def _flow_rows(summaries: list[GeneSetSummary]) -> list[dict[str, object]]:
+def _flow_rows(
+    summaries: list[GeneSetSummary],
+    species_keys: list[str] | None = None,
+) -> list[dict[str, object]]:
+    species_keys = species_keys or ["human", "mouse"]
     rows: list[dict[str, object]] = []
     for gene_set in summaries:
-        for species_key in ("human", "mouse"):
+        for species_key in species_keys:
             species = gene_set.species[species_key]
             rows.append({
                 "Gene Set": gene_set.gene_set,
@@ -349,7 +357,11 @@ def _flow_rows(summaries: list[GeneSetSummary]) -> list[dict[str, object]]:
     return rows
 
 
-def write_summary_workbook(rows: list[dict[str, object]], output_path: Path) -> None:
+def write_summary_workbook(
+    rows: list[dict[str, object]],
+    output_path: Path,
+    species_keys: list[str] | None = None,
+) -> None:
     columns = [
         "Gene Set",
         "Pipeline",
@@ -377,7 +389,9 @@ def write_summary_workbook(rows: list[dict[str, object]], output_path: Path) -> 
 
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(columns))
     title_cell = ws.cell(row=1, column=1)
-    title_cell.value = "Gene Set Summary: Fly to Human / Mouse Pipeline"
+    species_keys = species_keys or ["human", "mouse"]
+    species_labels = " / ".join(SPECIES_CONFIG[key]["label"] for key in species_keys)
+    title_cell.value = f"Gene Set Summary: Fly to {species_labels} Pipeline"
     title_cell.fill = title_fill
     title_cell.font = title_font
     title_cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -458,8 +472,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default="summary.xlsx",
-        help="Output filename, written next to the original gene set (default: summary.xlsx).",
+        default=None,
+        help=(
+            "Output filename, written next to the original gene set. Defaults to "
+            "`summary.xlsx` (or `summary_<species>.xlsx` when --ortholog is set)."
+        ),
     )
     parser.add_argument(
         "--human-dir",
@@ -470,6 +487,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--mouse-dir",
         default=None,
         help="Override path to the directory containing `*_mouse.csv` and `*_mouse_classification.xlsx`.",
+    )
+    parser.add_argument(
+        "--ortholog",
+        choices=sorted(SPECIES_CONFIG.keys()),
+        default=None,
+        help=(
+            "Restrict the summary to a single ortholog species. When omitted, "
+            "both human and mouse are included."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -484,31 +510,40 @@ def main(argv: list[str] | None = None) -> int:
     human_dir = Path(args.human_dir).expanduser().resolve() if args.human_dir else None
     mouse_dir = Path(args.mouse_dir).expanduser().resolve() if args.mouse_dir else None
 
+    species_keys = [args.ortholog] if args.ortholog else list(SPECIES_CONFIG.keys())
+
     summaries = build_summary(
         input_dir,
         input_gene_col=args.input_gene_col,
         human_dir=human_dir,
         mouse_dir=mouse_dir,
+        species_keys=species_keys,
     )
     if not summaries:
         print(f"No original gene-set CSVs found in {input_dir}", file=sys.stderr)
         return 1
 
-    rows = _flow_rows(summaries)
-    output_path = (input_dir / args.output) if not Path(args.output).is_absolute() else Path(args.output)
-    write_summary_workbook(rows, output_path)
+    rows = _flow_rows(summaries, species_keys)
+
+    output_name = args.output or (
+        f"summary_{args.ortholog}.xlsx" if args.ortholog else "summary.xlsx"
+    )
+    output_path = (
+        Path(output_name) if Path(output_name).is_absolute() else (input_dir / output_name)
+    )
+    write_summary_workbook(rows, output_path, species_keys)
 
     print(f"Summary written: {output_path}")
     for gene_set in summaries:
-        human = gene_set.species["human"]
-        mouse = gene_set.species["mouse"]
-        print(
-            f"  {gene_set.gene_set}: fly={gene_set.fly_unique} | "
-            f"human mapped={human.mapped_unique}, classified={human.classified_unique}, "
-            f"buckets={len(human.buckets)} | "
-            f"mouse mapped={mouse.mapped_unique}, classified={mouse.classified_unique}, "
-            f"buckets={len(mouse.buckets)}"
-        )
+        parts = [f"{gene_set.gene_set}: fly={gene_set.fly_unique}"]
+        for species_key in species_keys:
+            species = gene_set.species[species_key]
+            parts.append(
+                f"{species_key} mapped={species.mapped_unique}, "
+                f"classified={species.classified_unique}, "
+                f"buckets={len(species.buckets)}"
+            )
+        print("  " + " | ".join(parts))
     return 0
 
 

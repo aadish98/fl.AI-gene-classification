@@ -8,6 +8,13 @@ Run the pipeline from the repository root:
 python flai_gene_classification.py <input_directory> [options]
 ```
 
+The current subcommand form is:
+
+```bash
+python flai_gene_classification.py classify <input_directory> --species fly|human|mouse [options]
+python flai_gene_classification.py estimate <input_directory> --species fly|human|mouse [options]
+```
+
 | Argument | Default | Purpose |
 | --- | --- | --- |
 | `input_directory` | required | Directory containing input CSV files. |
@@ -17,7 +24,8 @@ python flai_gene_classification.py <input_directory> [options]
 | `--flybase-data-dir` | auto-detected | Optional FlyBase data directory. |
 | `--force-all` | off | Ignore checkpoint/run-store reuse and estimate or process everything again. |
 | `--soft-run` | off | Estimate OpenAI API usage and cost from metadata only. Does not call OpenAI or fetch full paper text. |
-| `--orthologs` | `none` | Optionally map fly genes to `human` or `mouse` orthologs before classification. |
+| `--orthologs` | `none` | Optionally map fly genes to `human` or `mouse` orthologs before classification. LLM summaries and classifications are organism-strict for the selected species. |
+| `--species` | `fly` | Subcommand-form species selector. `human` and `mouse` trigger ortholog mapping before classification/estimation. |
 | `--diopt-filter` | `exclude_low_score_2` | DIOPT filter used for ortholog lookup. |
 | `--human-data-dir` | `$FLAI_CACHE_DIR/human-data` or `~/.cache/flai-gene-classification/human-data` | Cache directory for human HGNC/gene2pubmed/GeneRIF/UniProt data. |
 | `--mouse-data-dir` | `$FLAI_CACHE_DIR/mouse-data` or `~/.cache/flai-gene-classification/mouse-data` | Cache directory for mouse MGI/gene2pubmed/GeneRIF/UniProt data. |
@@ -66,6 +74,10 @@ python flai_gene_classification.py ./InputCSVs \
 
 The soft-run uses a fast candidate-count proxy with an empirical species keyword-pass rate. It does not call OpenAI, fetch full paper text, or resolve every candidate title/abstract.
 
+Species-aware prompt and reference-filter changes are cache-versioned. The
+first real run after a cache schema bump regenerates older cached summaries;
+use `--force-all` when you want to explicitly discard all checkpoint reuse.
+
 ## Force a Fresh Estimate or Run
 
 Ignore existing checkpoint/run-store reuse:
@@ -91,6 +103,11 @@ python flai_gene_classification.py ./InputCSVs \
   --soft-run
 ```
 
+Human runs summarize and classify only human-gene evidence. Europe PMC,
+PubMed, Gene2PubMed, GeneRIF, and UniProt discovery are scoped to `Homo
+sapiens`, and LLM summaries skip references that only describe non-human
+orthologs.
+
 ## Mouse Ortholog Mode
 
 Map fly genes to mouse orthologs:
@@ -101,6 +118,11 @@ python flai_gene_classification.py ./InputCSVs \
   --diopt-filter "exclude_low_score_2" \
   --keywords "development,behavior"
 ```
+
+Mouse runs summarize and classify only mouse-gene evidence. Europe PMC,
+PubMed, Gene2PubMed, GeneRIF, and UniProt discovery are scoped to `Mus
+musculus`, and LLM summaries skip references that only describe non-mouse
+orthologs.
 
 ## Custom Data Directories
 

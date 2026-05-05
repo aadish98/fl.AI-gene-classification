@@ -22,21 +22,29 @@
     }
   ],
   "species_keyword_pass_rates": {
+    "fly": {
+      "calibration_limited_references": 3,
+      "calibration_metadata_keyword_matches": 3,
+      "keyword_pass_rate": 1.0,
+      "reference_limit": 1,
+      "source": "/Volumes/umms-rallada/UM Lab Users/Aadish/fl.AI-gene-classification/Data/Test-vGAT-extra-small/vGAT_aggregated_fl-AI.csv",
+      "updated_at_utc": "2026-05-05T21:37:17Z"
+    },
     "human": {
-      "calibration_limited_references": 23564,
-      "calibration_metadata_keyword_matches": 5504,
-      "keyword_pass_rate": 0.23357664233576642,
-      "reference_limit": 150,
-      "source": "/nfs/turbo/umms-rallada/UM Lab Users/Aadish/fl.AI-gene-classification/Data/Tx-Omics-Conserved-Medium/Subset2-M/Human/Wake gene list FC1 Table_human.csv",
-      "updated_at_utc": "2026-05-02T08:42:22Z"
+      "calibration_limited_references": 107758,
+      "calibration_metadata_keyword_matches": 21133,
+      "keyword_pass_rate": 0.19611536962452902,
+      "reference_limit": 250,
+      "source": "/nfs/turbo/umms-rallada/UM Lab Users/Aadish/fl.AI-gene-classification/Data/Tx-Omics-Conserved-CSW-Large/Human/Sleep gene list FC0.5 Table_human.csv",
+      "updated_at_utc": "2026-05-05T09:34:21Z"
     },
     "mouse": {
-      "calibration_limited_references": 16313,
-      "calibration_metadata_keyword_matches": 1093,
-      "keyword_pass_rate": 0.06700177772328818,
-      "reference_limit": 150,
-      "source": "/nfs/turbo/umms-rallada/UM Lab Users/Aadish/fl.AI-gene-classification/Data/Tx-Omics-Conserved-Medium/Subset2-M/Mouse/Wake gene list FC1 Table_mouse.csv",
-      "updated_at_utc": "2026-05-02T01:41:56Z"
+      "calibration_limited_references": 95878,
+      "calibration_metadata_keyword_matches": 8013,
+      "keyword_pass_rate": 0.08357495984480277,
+      "reference_limit": 250,
+      "source": "/nfs/turbo/umms-rallada/UM Lab Users/Aadish/fl.AI-gene-classification/Data/Tx-Omics-Conserved-CSW-Large/Mouse/Wake gene list FC0.5 Table_mouse.csv",
+      "updated_at_utc": "2026-05-05T09:02:53Z"
     }
   }
 }

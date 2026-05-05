@@ -211,7 +211,7 @@ GET_FBGN_IDS_SCRIPT = Path(__file__).parent / "HelperScripts" / "GetFBgnIDs.py"
 BATCH_SIZE = 50
 BATCH_STATE_DIRNAME = ".batch_state"
 RUN_STORE_FILENAME = "run_store.json"
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 MAX_PROMPT_WORDS = 5000
 SHARED_PROMPT_OVERHEAD_WORDS = 800
 MIN_CHUNK_WORDS = 750
@@ -1329,6 +1329,7 @@ class EuropePMCSearchProvider(ReferenceProvider):
 class SpeciesAdapter:
     key: str
     display_name: str
+    scientific_name: str
     taxon_id: int
     gene_id_column: str
     symbol_column: str
@@ -1395,13 +1396,14 @@ def get_species_adapter(key: str) -> SpeciesAdapter:
         return SpeciesAdapter(
             key="fly",
             display_name="Fly",
+            scientific_name="Drosophila melanogaster",
             taxon_id=7227,
             gene_id_column="FlyBase_ID",
             symbol_column="Fly_Gene_symbol",
             authority_id_column="FlyBase_ID",
             output_suffix="_classification.xlsx",
             pubmed_filter='("drosophila" OR "fruit fly")',
-            europe_pmc_filter='("drosophila" OR "fruit fly") AND "gene"',
+            europe_pmc_filter='(ORGANISM:"Drosophila melanogaster" OR MESH:"Drosophila melanogaster")',
             source_priority={"pubmed": 3, "flybase": 2, "europe_pmc": 1},
             local_provider=FlyBaseReferenceProvider(),
         )
@@ -1409,13 +1411,14 @@ def get_species_adapter(key: str) -> SpeciesAdapter:
         return SpeciesAdapter(
             key="human",
             display_name="Human",
+            scientific_name="Homo sapiens",
             taxon_id=9606,
             gene_id_column="Entrez_Gene_ID",
             symbol_column="Human_Gene_symbol",
             authority_id_column="HGNC_ID",
             output_suffix="_human_classification.xlsx",
             pubmed_filter='Homo sapiens[Organism]',
-            europe_pmc_filter='',
+            europe_pmc_filter='(ORGANISM:"Homo sapiens" OR MESH:"Humans")',
             source_priority={"generif": 5, "uniprot": 4, "gene2pubmed": 3, "pubmed": 2, "europe_pmc": 1},
             data_module=human_gene_data,
             require_open_access=False,
@@ -1424,13 +1427,14 @@ def get_species_adapter(key: str) -> SpeciesAdapter:
         return SpeciesAdapter(
             key="mouse",
             display_name="Mouse",
+            scientific_name="Mus musculus",
             taxon_id=10090,
             gene_id_column="Entrez_Gene_ID",
             symbol_column="Mouse_Gene_symbol",
             authority_id_column="MGI_ID",
             output_suffix="_mouse_classification.xlsx",
             pubmed_filter='Mus musculus[Organism]',
-            europe_pmc_filter='',
+            europe_pmc_filter='(ORGANISM:"Mus musculus" OR MESH:"Mice")',
             source_priority={"generif": 5, "uniprot": 4, "gene2pubmed": 3, "pubmed": 2, "europe_pmc": 1},
             data_module=mouse_gene_data,
             require_open_access=False,
@@ -1911,6 +1915,7 @@ class FunctionPhenotypeSummary(BaseModel):
     phenotypes: str = ""
     skip_reference: bool = False
     skip_reason: str = ""
+    species_specific: bool = True
 
 
 class FinalFunctionPhenotypeSummary(BaseModel):
@@ -2001,7 +2006,7 @@ def _chunk_text_by_word_budget(text: str, max_words: int) -> list[str]:
 def _build_shared_prompt_chunks(
     full_text: str,
     gene_symbol: str,
-    fbgn_id: str,
+    gene_id: str,
     synonyms: list[str],
     title: str = "",
     abstract: str = "",
@@ -2013,7 +2018,7 @@ def _build_shared_prompt_chunks(
 
     metadata_blob = " ".join([
         str(gene_symbol or ""),
-        str(fbgn_id or ""),
+        str(gene_id or ""),
         " ".join(sorted(set(synonyms or []))),
         str(title or ""),
         str(abstract or ""),
@@ -2239,29 +2244,38 @@ def _parse_structured_completion(
 def _build_summary_messages(
     text_chunk: str,
     gene_symbol: str,
-    fbgn_id: str,
+    gene_id: str,
     synonyms: list[str],
+    adapter: Optional[SpeciesAdapter] = None,
     title: str = "",
     abstract: str = "",
 ) -> list[dict[str, str]]:
+    adapter = adapter or get_species_adapter("fly")
     synonyms_str = ", ".join(sorted(set(synonyms))) if synonyms else ""
     sys = (
-        "You are an expert biomedical assistant. Use ONLY the provided title, abstract, "
-        "and text chunk. Focus only on the target gene. If the chunk contains no direct "
-        "evidence about the target gene, set skip_reference to true."
+        f"You are an expert biomedical assistant focused on the {adapter.scientific_name} "
+        f"gene `{gene_symbol}` (NCBI taxon ID {adapter.taxon_id}). Use ONLY the provided "
+        "title, abstract, and text chunk. Do not describe orthologs, paralogs, or "
+        f"homologs in any other species. If the chunk only discusses a non-{adapter.display_name} "
+        f"ortholog/paralog, or contains no direct evidence about the {adapter.display_name} "
+        f"gene `{gene_symbol}`, set skip_reference=true and species_specific=false."
     )
-    user = f"""Assess evidence for gene {gene_symbol} (Gene ID: {fbgn_id}; Synonyms: {synonyms_str}).
+    user = f"""Target species: {adapter.scientific_name} (NCBI taxon ID {adapter.taxon_id})
+Target gene: {gene_symbol} (Gene ID: {gene_id}; Synonyms: {synonyms_str})
 
 Return JSON with fields:
-- function: concise summary of gene {gene_symbol} function evidence from this chunk only
-- phenotypes: concise summary of phenotype evidence of gene {gene_symbol} from this chunk only
-- skip_reference: true if this chunk does not contain direct evidence for {gene_symbol}
+- function: concise summary of {adapter.display_name} gene {gene_symbol} function evidence from this chunk only
+- phenotypes: concise summary of phenotype evidence of {adapter.display_name} gene {gene_symbol} from this chunk only
+- skip_reference: true if this chunk does not contain direct {adapter.display_name}-specific evidence for {gene_symbol}
 - skip_reason: brief reason when skip_reference is true
+- species_specific: true only if the chunk provides evidence explicitly about the {adapter.display_name} gene {gene_symbol}; false for evidence only about another organism's ortholog/paralog/homolog
 
 Rules:
 - Always name {gene_symbol} explicitly
 - Be factual and use only the provided text
-- If evidence is generic or unrelated to {gene_symbol}, set skip_reference to true
+- Describe only {adapter.display_name} biology; ignore orthologs, paralogs, or homologs in other species
+- If evidence is generic, cross-species without {adapter.display_name}-specific evidence, or only about a non-{adapter.display_name} ortholog, set skip_reference=true and species_specific=false
+- Set species_specific=true only when the chunk's evidence is explicitly about the {adapter.display_name} gene `{gene_symbol}`
 - If one field is absent but the chunk still contains evidence, return an empty string for that field
 
 Title: {title or ''}
@@ -2274,9 +2288,11 @@ Text chunk:
 
 def _build_rewrite_messages(
     gene_symbol: str,
-    fbgn_id: str,
+    gene_id: str,
     chunk_summaries: list[dict[str, Any]],
+    adapter: Optional[SpeciesAdapter] = None,
 ) -> list[dict[str, str]]:
+    adapter = adapter or get_species_adapter("fly")
     chunk_lines = []
     for idx, chunk_summary in enumerate(chunk_summaries or [], start=1):
         function_text = _clean_text(chunk_summary.get("function", ""))
@@ -2288,10 +2304,13 @@ def _build_rewrite_messages(
         )
     merged_input = "\n\n".join(chunk_lines)
     sys = (
-        "You are an expert biomedical assistant. Merge chunk-level evidence summaries into a "
-        "single cohesive paper-level summary. Use ONLY the provided chunk summaries."
+        f"You are an expert biomedical assistant focused on the {adapter.scientific_name} "
+        f"gene `{gene_symbol}` (NCBI taxon ID {adapter.taxon_id}). Merge chunk-level "
+        "evidence summaries into a single cohesive paper-level summary. Use ONLY the "
+        f"provided chunk summaries and do not introduce evidence about non-{adapter.display_name} "
+        "orthologs, paralogs, or homologs."
     )
-    user = f"""Rewrite these chunk-level summaries for gene {gene_symbol} (Gene ID: {fbgn_id}) into one cohesive paper summary.
+    user = f"""Rewrite these chunk-level summaries for the {adapter.display_name} gene {gene_symbol} (Gene ID: {gene_id}) into one cohesive paper summary.
 
 Return JSON with fields:
 - function
@@ -2299,9 +2318,11 @@ Return JSON with fields:
 
 Rules:
 - Always name {gene_symbol} explicitly
+- Summarize only {adapter.display_name} biology for {gene_symbol}
 - Preserve factual content only
 - Remove redundancy across chunks
 - Do not introduce new claims
+- Do not include evidence about non-{adapter.display_name} orthologs/paralogs/homologs, even if input chunk summaries imply it
 
 Chunk summaries:
 {merged_input}"""
@@ -2312,16 +2333,26 @@ def _build_classification_messages(
     gene_symbol: str,
     keywords_list: list[str],
     full_text: str,
+    adapter: Optional[SpeciesAdapter] = None,
 ) -> list[dict[str, str]]:
+    adapter = adapter or get_species_adapter("fly")
     cats = [k.strip() for k in keywords_list if k and k.strip() and k.strip().lower() != "none"]
     cats_line = ", ".join(cats) if cats else "None"
     sys = (
-        "You are an expert biomedical assistant. Use ONLY the provided text. "
-        "If evidence is weak or ambiguous, return category as empty list [] or None."
+        f"You are an expert biomedical assistant focused on the {adapter.scientific_name} "
+        f"gene `{gene_symbol}` (NCBI taxon ID {adapter.taxon_id}). Use ONLY the provided "
+        f"text. Classify only evidence pertaining to the {adapter.display_name} gene. "
+        "If evidence is weak, ambiguous, or predominantly about a non-target organism, "
+        "return category as empty list [] or None."
     )
     user = (
-        f"Classify gene '{gene_symbol}'. Allowed categories: [{cats_line}]. "
+        f"Classify the {adapter.display_name} gene '{gene_symbol}' "
+        f"({adapter.scientific_name}, NCBI taxon ID {adapter.taxon_id}). "
+        f"Allowed categories: [{cats_line}]. "
         "You may classify into 1 category, N categories, or None (return empty list [] or None). "
+        "If the text predominantly describes a non-"
+        f"{adapter.display_name} ortholog/paralog/homolog, return an empty category list "
+        "with rationale noting cross-species text. "
         "Return JSON with fields: gene, category (list of strings, can be empty or None), confidence (0-100), rationale (1-2 lines).\n\n"
         "TEXT START\n" + full_text[:200000] + "\nTEXT END"
     )
@@ -2331,9 +2362,10 @@ def _build_classification_messages(
 def summarize_reference_function(
     text_chunk: str,
     gene_symbol: str,
-    fbgn_id: str,
+    gene_id: str,
     synonyms: list[str],
     model_name: Optional[str] = None,
+    adapter: Optional[SpeciesAdapter] = None,
     title: str = "",
     abstract: str = "",
     chunk_index: int = 1,
@@ -2342,10 +2374,19 @@ def summarize_reference_function(
     usage_events: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Extract function and phenotype evidence for one chunk of a paper."""
+    adapter = adapter or get_species_adapter("fly")
     try:
         summary_model = _get_summary_model(model_name)
         out = _parse_structured_completion(
-            _build_summary_messages(text_chunk, gene_symbol, fbgn_id, synonyms, title=title, abstract=abstract),
+            _build_summary_messages(
+                text_chunk,
+                gene_symbol,
+                gene_id,
+                synonyms,
+                adapter=adapter,
+                title=title,
+                abstract=abstract,
+            ),
             response_format=FunctionPhenotypeSummary,
             model_name=summary_model,
             max_output_tokens=OUTPUT_CAP_PER_REF,
@@ -2357,7 +2398,8 @@ def summarize_reference_function(
             usage_context={
                 "request_type": "summary_chunk",
                 "gene_symbol": gene_symbol,
-                "gene_id": fbgn_id,
+                "gene_id": gene_id,
+                "species": adapter.key,
                 "paper_id": paper_id,
                 "chunk_index": int(chunk_index),
                 "total_chunks": int(total_chunks),
@@ -2369,6 +2411,12 @@ def summarize_reference_function(
         phenotype_text = _clean_text(parsed.get("phenotypes", ""))
         skip_reference = bool(parsed.get("skip_reference", False))
         skip_reason = _clean_text(parsed.get("skip_reason", ""))
+        species_specific = bool(parsed.get("species_specific", True))
+        if not skip_reference and not species_specific:
+            skip_reference = True
+            skip_reason = skip_reason or (
+                f"Chunk does not provide {adapter.display_name}-specific evidence"
+            )
         if not skip_reference and not function_text and not phenotype_text:
             skip_reference = True
             skip_reason = skip_reason or "No function or phenotype evidence returned"
@@ -2391,13 +2439,15 @@ def summarize_reference_function(
 
 def rewrite_function_summary(
     gene_symbol: str,
-    fbgn_id: str,
+    gene_id: str,
     chunk_summaries: list[dict[str, Any]],
     model_name: Optional[str] = None,
+    adapter: Optional[SpeciesAdapter] = None,
     paper_id: str = "",
     usage_events: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, str]:
     """Rewrite multiple chunk-level summaries into one cohesive paper summary."""
+    adapter = adapter or get_species_adapter("fly")
     fallback = {
         "function": _join_unique_texts([summary.get("function", "") for summary in chunk_summaries]),
         "phenotypes": _join_unique_texts([summary.get("phenotypes", "") for summary in chunk_summaries]),
@@ -2405,7 +2455,7 @@ def rewrite_function_summary(
     try:
         summary_model = _get_summary_model(model_name)
         out = _parse_structured_completion(
-            _build_rewrite_messages(gene_symbol, fbgn_id, chunk_summaries),
+            _build_rewrite_messages(gene_symbol, gene_id, chunk_summaries, adapter=adapter),
             response_format=FinalFunctionPhenotypeSummary,
             model_name=summary_model,
             max_output_tokens=OUTPUT_CAP_PER_REF,
@@ -2417,7 +2467,8 @@ def rewrite_function_summary(
             usage_context={
                 "request_type": "summary_rewrite",
                 "gene_symbol": gene_symbol,
-                "gene_id": fbgn_id,
+                "gene_id": gene_id,
+                "species": adapter.key,
                 "paper_id": paper_id,
                 "chunk_count": len(chunk_summaries or []),
             },
@@ -2498,17 +2549,19 @@ def classify_gene_from_text(
     keywords_list: list[str],
     full_text: str,
     model_name: Optional[str] = None,
+    adapter: Optional[SpeciesAdapter] = None,
     gene_id: str = "",
     usage_events: Optional[list[dict[str, Any]]] = None,
     high_quality_reference_count: int = 0,
 ):
     """Classify a gene using GPT."""
+    adapter = adapter or get_species_adapter("fly")
     if not full_text or not full_text.strip():
         return {"gene": gene_symbol, "category": [], "confidence": 0, "rationale": "No text provided for classification"}
     
     cats = [k.strip() for k in keywords_list if k and k.strip() and k.strip().lower() != "none"]
     valid_cats = set(cats) if cats else set()
-    messages = _build_classification_messages(gene_symbol, keywords_list, full_text)
+    messages = _build_classification_messages(gene_symbol, keywords_list, full_text, adapter=adapter)
 
     try:
         classification_model = _get_classification_model(model_name)
@@ -2526,6 +2579,7 @@ def classify_gene_from_text(
                 "request_type": "classification",
                 "gene_symbol": gene_symbol,
                 "gene_id": gene_id,
+                "species": adapter.key,
                 "high_quality_reference_count": int(high_quality_reference_count),
                 "classification_text_words": _count_words(full_text),
             },
@@ -2550,7 +2604,7 @@ def classify_gene_from_text(
             try:
                 shorter_text = full_text[:50000]
                 out = _parse_structured_completion(
-                    _build_classification_messages(gene_symbol, keywords_list, shorter_text),
+                    _build_classification_messages(gene_symbol, keywords_list, shorter_text, adapter=adapter),
                     response_format=GeneClassification,
                     model_name=_get_classification_model(model_name),
                     max_output_tokens=2000,
@@ -2563,6 +2617,7 @@ def classify_gene_from_text(
                         "request_type": "classification_retry_short_context",
                         "gene_symbol": gene_symbol,
                         "gene_id": gene_id,
+                        "species": adapter.key,
                         "high_quality_reference_count": int(high_quality_reference_count),
                         "classification_text_words": _count_words(shorter_text),
                     },
@@ -2832,6 +2887,7 @@ def process_gene_set(
                     gene.symbol,
                     gene.gene_id,
                     synonyms,
+                    adapter=adapter,
                     title=title,
                     abstract=abstract,
                     chunk_index=chunk_index,
@@ -2857,6 +2913,7 @@ def process_gene_set(
                         gene.symbol,
                         gene.gene_id,
                         function_chunk_summaries,
+                        adapter=adapter,
                         paper_id=paper_id,
                         usage_events=gene_to_openai_usage_events[gene.gene_id],
                     )
@@ -2913,6 +2970,7 @@ def process_gene_set(
                 gene.symbol,
                 keywords_list,
                 agg_text,
+                adapter=adapter,
                 gene_id=gene.gene_id,
                 usage_events=gene_to_openai_usage_events[gene.gene_id],
                 high_quality_reference_count=len(chunks),
@@ -3458,10 +3516,28 @@ def generate_excel_output(gene_hits, all_summaries, validated, output_path, gene
     if "_year_sort" in ref_df.columns:
         ref_df = ref_df.drop(columns=["_year_sort"])
     log_step("Writing Excel workbook", indent=2)
-    # Write Excel
+    # openpyxl rejects XML-illegal control chars (\x00-\x08, \x0b-\x0c, \x0e-\x1f)
+    # in cell values; LLM-generated summaries occasionally contain them. Scrub
+    # any object-dtype string column on each sheet before writing.
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+
+    def _scrub_illegal_xlsx_chars(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].map(
+                    lambda v: ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v
+                )
+        return df
+
+    class_df = _scrub_illegal_xlsx_chars(class_df)
+    ref_df = _scrub_illegal_xlsx_chars(ref_df)
+
     excel_buf = io.BytesIO()
     with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
         gene_df = gene_set_df.copy() if isinstance(gene_set_df, pd.DataFrame) else pd.DataFrame()
+        gene_df = _scrub_illegal_xlsx_chars(gene_df)
         gene_df.to_excel(writer, index=False, sheet_name="Gene Set")
         class_df.to_excel(writer, index=False, sheet_name="Classification")
         ref_df.to_excel(writer, index=False, sheet_name="Reference Summaries")
@@ -4599,6 +4675,10 @@ def _execute_pipeline(args: argparse.Namespace) -> int:
     mouse_gene_data.configure(args.mouse_data_dir or None, refresh=args.refresh_mouse_data)
 
     adapter = get_species_adapter("fly" if args.orthologs == "none" else args.orthologs)
+    log_step(
+        "Using species-strict prompt cache schema",
+        f"v{CACHE_SCHEMA_VERSION}; cached summaries from older schemas will be regenerated",
+    )
 
     if args.orthologs != "none":
         log_step("Mapping fly genes to orthologs", args.orthologs)
