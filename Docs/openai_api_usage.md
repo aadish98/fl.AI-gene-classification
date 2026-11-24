@@ -33,7 +33,7 @@ Defined at the top of `flai_gene_classification.py`:
 
 ```71:74:flai_gene_classification.py
 DEFAULT_SUMMARY_MODEL = "gpt-6-luna"
-DEFAULT_CLASSIFICATION_MODEL = "gpt-6.1-sol"
+DEFAULT_CLASSIFICATION_MODEL = "gpt-6.2-sol"
 DEFAULT_SUMMARY_REASONING_EFFORT = "medium"
 DEFAULT_CLASSIFICATION_REASONING_EFFORT = "high"
 ```
@@ -42,11 +42,11 @@ DEFAULT_CLASSIFICATION_REASONING_EFFORT = "high"
 | --- | --- | --- |
 | Per-chunk reference summarization | `gpt-6-luna` | `medium` |
 | Multi-chunk paper-level rewrite | `gpt-6-luna` | `medium` |
-| Per-gene final classification | `gpt-6.1-sol` | `high` |
+| Per-gene final classification | `gpt-6.2-sol` | `high` |
 
 Reasoning effort is only attached to the request if the resolved model name
 is in the GPT-5-or-later family (matches `gpt-<N>` with `N >= 5`,
-case-insensitive, e.g. `gpt-6-luna`, `gpt-6.1-sol`) and the effort string is
+case-insensitive, e.g. `gpt-6-luna`, `gpt-6.2-sol`) and the effort string is
 non-empty. If
 the OpenAI server rejects the parameter (`Unsupported parameter:
 'reasoning.effort'`), the call is automatically retried once without the
@@ -61,7 +61,7 @@ Prices are read from `Data/openai_pricing.csv` (refreshed from LiteLLM on every
 | Model (USD / 1M tokens) | Input | Cached input | Output |
 | --- | --- | --- | --- |
 | `gpt-6-luna` (summary default) | $0.10 | $0.01 | $0.50 |
-| `gpt-6.1-sol` (classification default) | $2.00 | $0.10 | $10.00 |
+| `gpt-6.2-sol` (classification default) | $2.00 | $0.10 | $10.00 |
 
 Expected cost from the pooled run telemetry (~20,848 input / ~436 output tokens
 per reference; ~639 input / ~292 output tokens per classified gene; no cache
@@ -69,7 +69,7 @@ discount): about **$2.30 per 1,000 references** and **$4.20 per 1,000
 classified genes**. Output tokens include reasoning tokens, so actual cost
 depends on how many the models emit at the configured effort.
 
-`gpt-6.1-sol` accepts `low`, `medium`, `high`, `xhigh` and `max` reasoning
+`gpt-6.2-sol` accepts `low`, `medium`, `high`, `xhigh` and `max` reasoning
 effort, but not `none` or `minimal`.
 
 Retired defaults, their prices, and the old cost comparison are in
@@ -480,7 +480,7 @@ deterministic merge of the two `Function:` / `Phenotypes:` strings via
 **Caller:** `process_gene_set`, once per gene that has at least one
 high-quality reference summary. The aggregated input is
 `"\n\n".join(high_quality_summary_blocks)`.
-**Default model:** `gpt-6.1-sol` (override `OPENAI_CLASSIFICATION_MODEL`).
+**Default model:** `gpt-6.2-sol` (override `OPENAI_CLASSIFICATION_MODEL`).
 **Reasoning effort:** `high` (override `OPENAI_CLASSIFICATION_REASONING_EFFORT`).
 **`max_output_tokens`:** `OUTPUT_CAP_PER_CLASSIFICATION` = `4000`
 (short-context retry uses `2000`).
@@ -705,7 +705,7 @@ the OpenAI API:
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Per-chunk reference summary | `summarize_reference_function` | `OPENAI_SUMMARY_MODEL` (`gpt-6-luna`) | `OPENAI_SUMMARY_REASONING_EFFORT` (`medium`) | 1200 | `FunctionPhenotypeSummary` |
 | 2 | Multi-chunk paper rewrite | `rewrite_function_summary` | `OPENAI_SUMMARY_MODEL` (`gpt-6-luna`) | `OPENAI_SUMMARY_REASONING_EFFORT` (`medium`) | 1200 | `FinalFunctionPhenotypeSummary` |
-| 3 | Final classification | `classify_gene_from_text` | `OPENAI_CLASSIFICATION_MODEL` (`gpt-6.1-sol`) | `OPENAI_CLASSIFICATION_REASONING_EFFORT` (`high`) | 4000 (retry: 2000) | `GeneClassification` |
+| 3 | Final classification | `classify_gene_from_text` | `OPENAI_CLASSIFICATION_MODEL` (`gpt-6.2-sol`) | `OPENAI_CLASSIFICATION_REASONING_EFFORT` (`high`) | 4000 (retry: 2000) | `GeneClassification` |
 
 All three go through `_parse_structured_completion → client.responses.parse`
 with up to 3 retries and per-attempt token-usage logging.

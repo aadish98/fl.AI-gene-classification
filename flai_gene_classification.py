@@ -69,7 +69,7 @@ except ImportError:  # pragma: no cover - fcntl is available on macOS/Linux HPC.
     fcntl = None
 
 DEFAULT_SUMMARY_MODEL = "gpt-6-luna"
-DEFAULT_CLASSIFICATION_MODEL = "gpt-6.1-sol"
+DEFAULT_CLASSIFICATION_MODEL = "gpt-6.2-sol"
 DEFAULT_SUMMARY_REASONING_EFFORT = "medium"
 DEFAULT_CLASSIFICATION_REASONING_EFFORT = "high"
 OPENAI_PRICING_CSV_PATH = PROJECT_ROOT / "Data" / "openai_pricing.csv"

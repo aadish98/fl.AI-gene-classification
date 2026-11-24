@@ -40,7 +40,7 @@ Assume one gene (`gene X`, `FBgn0009999`) and keywords `sleep,circadian,synapse`
 - Environment variables:
   - `OPENAI_API_KEY` (required for summarization/classification)
   - `OPENAI_SUMMARY_MODEL` (optional, defaults to `gpt-6-luna`)
-  - `OPENAI_CLASSIFICATION_MODEL` (optional, defaults to `gpt-6.1-sol`)
+  - `OPENAI_CLASSIFICATION_MODEL` (optional, defaults to `gpt-6.2-sol`)
   - `OPENAI_SUMMARY_REASONING_EFFORT` (optional, defaults to `low`)
   - `OPENAI_CLASSIFICATION_REASONING_EFFORT` (optional, defaults to `high`)
   - `NCBI_API_KEY` (optional, improves NCBI throughput)

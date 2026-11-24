@@ -2,7 +2,7 @@
 
 Archive of models this pipeline used as defaults and has since retired. Current
 docs describe only the current defaults (`gpt-6-luna` for summaries,
-`gpt-6.1-sol` for classification); anything that needs the old numbers lives here.
+`gpt-6.2-sol` for classification); anything that needs the old numbers lives here.
 
 ## Retired defaults
 
@@ -20,7 +20,7 @@ From `Data/openai_pricing.csv` (LiteLLM, fetched 2026-10-07).
 | Stage | Retired model | Input / Cached / Output | Current model | Input / Cached / Output | Change |
 | --- | --- | --- | --- | --- | --- |
 | Summary | `gpt-5.4-nano` | $0.20 / $0.02 / $1.25 | `gpt-6-luna` | $0.10 / $0.01 / $0.50 | -50% / -50% / -60% |
-| Classification | `gpt-5.4` | $2.50 / $0.25 / $15.00 | `gpt-6.1-sol` | $2.00 / $0.10 / $10.00 | -20% / -60% / -33% |
+| Classification | `gpt-5.4` | $2.50 / $0.25 / $15.00 | `gpt-6.2-sol` | $2.00 / $0.10 / $10.00 | -20% / -60% / -33% |
 
 ## Expected cost at the switch
 

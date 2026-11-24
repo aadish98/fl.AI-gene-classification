@@ -65,6 +65,7 @@ gpt-6-astra,10.0,1.0,50.0,https://raw.githubusercontent.com/BerriAI/litellm/main
 gpt-6-luna,0.09999999999999999,0.01,0.5,https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json,2026-10-07T23:30:30Z
 gpt-6-sol,2.0,0.19999999999999998,10.0,https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json,2026-10-07T23:30:30Z
 gpt-6.1-sol,2.0,0.09999999999999999,10.0,https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json,2026-10-07T23:30:30Z
+gpt-6.2-sol,2.0,0.1,10.0,https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json,2026-11-24T17:00:00Z
 gpt-daybreak-blue-latest,4.0,0.39999999999999997,20.0,https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json,2026-10-07T23:30:30Z
 gpt-daybreak-red-latest,12.5,1.25,75.0,https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json,2026-10-07T23:30:30Z
 gpt-realtime,4.0,0.39999999999999997,16.0,https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json,2026-10-07T23:30:30Z
