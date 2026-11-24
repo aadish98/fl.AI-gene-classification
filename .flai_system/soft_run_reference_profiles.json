@@ -31,12 +31,12 @@
   ],
   "species_keyword_pass_rates": {
     "fly": {
-      "calibration_limited_references": 3,
+"calibration_limited_references": 41,
       "calibration_metadata_keyword_matches": 3,
-      "keyword_pass_rate": 1.0,
-      "reference_limit": 1,
-      "source": "/Volumes/umms-rallada/UM Lab Users/Aadish/fl.AI-gene-classification/Data/Test-vGAT-extra-small/vGAT_aggregated_fl-AI.csv",
-      "updated_at_utc": "2026-05-05T21:37:17Z"
+      "keyword_pass_rate": 0.07317073170731707,
+      "reference_limit": 500,
+      "source": "/Users/aadishms/Desktop/Projects.nosync/Allada_GeneRef_Search/merged_csw_revision/output/RpL37-1/input/RpL37-1.csv",
+      "updated_at_utc": "2026-10-29T19:21:21Z"
     },
     "human": {
       "calibration_limited_references": 125783,
