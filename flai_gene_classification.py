@@ -68,8 +68,8 @@ try:
 except ImportError:  # pragma: no cover - fcntl is available on macOS/Linux HPC.
     fcntl = None
 
-DEFAULT_SUMMARY_MODEL = "gpt-5.4-nano"
-DEFAULT_CLASSIFICATION_MODEL = "gpt-5.4"
+DEFAULT_SUMMARY_MODEL = "gpt-6-luna"
+DEFAULT_CLASSIFICATION_MODEL = "gpt-6.2-sol"
 DEFAULT_SUMMARY_REASONING_EFFORT = "medium"
 DEFAULT_CLASSIFICATION_REASONING_EFFORT = "high"
 OPENAI_PRICING_CSV_PATH = PROJECT_ROOT / "Data" / "openai_pricing.csv"
@@ -2145,10 +2145,10 @@ def _get_reasoning_config(
     model_name: str,
     reasoning_effort: Optional[str] = None,
 ) -> Optional[dict[str, str]]:
-    """Use Responses API reasoning controls for GPT-5 family models when configured."""
+    """Use Responses API reasoning controls for GPT-5 and GPT-6 models when configured."""
     model = str(model_name or "").strip().lower()
     effort = str(reasoning_effort or "").strip().lower()
-    if model.startswith("gpt-5") and effort:
+    if effort and (model.startswith("gpt-5") or model.startswith("gpt-6")):
         return {"effort": effort}
     return None
 

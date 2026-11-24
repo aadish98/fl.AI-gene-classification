@@ -22,6 +22,14 @@
     }
   ],
   "species_keyword_pass_rates": {
+    "fly": {
+      "calibration_limited_references": 41,
+      "calibration_metadata_keyword_matches": 3,
+      "keyword_pass_rate": 0.07317073170731707,
+      "reference_limit": 500,
+      "source": "/Users/aadishms/Desktop/Projects.nosync/Allada_GeneRef_Search/merged_csw_revision/output/RpL37-1/input/RpL37-1.csv",
+      "updated_at_utc": "2026-10-29T19:21:21Z"
+    },
     "human": {
       "calibration_limited_references": 23564,
       "calibration_metadata_keyword_matches": 5504,
