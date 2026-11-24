@@ -1,6 +1,6 @@
 # fl.AI Gene Classification
 
-Standalone gene classification pipeline that converts input fly gene symbols to FlyBase IDs, optionally maps them to human or mouse orthologs, finds species-scoped supporting literature, summarizes evidence, and classifies each gene into user-defined categories.
+Standalone gene classification pipeline that classifies fly, human, or mouse gene sets, optionally maps fly genes to human or mouse orthologs, finds species-scoped supporting literature, summarizes evidence, and classifies each gene into user-defined categories.
 
 ## Documentation
 
@@ -13,6 +13,7 @@ All non-code documentation lives under [`Docs/`](Docs/):
 ## High-Level Flow
 
 - Read every input CSV in a directory and extract fly gene symbols from a configurable column.
+- Native human and mouse runs can read symbols directly and resolve them through HGNC or MGI without FlyBase or DIOPT.
 - Convert symbols to `FBgn` identifiers using the project helper script.
 - Optional: map fly genes to human or mouse orthologs with DIOPT.
 - Build a species-specific gene set (`fly`, `human`, or `mouse`) with canonical symbols, IDs, and synonyms.
@@ -38,8 +39,8 @@ Assume one gene (`gene X`, `FBgn0009999`) and keywords `sleep,circadian,synapse`
 - Dependencies in `requirements.txt`
 - Environment variables:
   - `OPENAI_API_KEY` (required for summarization/classification)
-  - `OPENAI_SUMMARY_MODEL` (optional, defaults to `gpt-5.4-nano`)
-  - `OPENAI_CLASSIFICATION_MODEL` (optional, defaults to `gpt-5.4`)
+  - `OPENAI_SUMMARY_MODEL` (optional, defaults to `gpt-6-luna`)
+  - `OPENAI_CLASSIFICATION_MODEL` (optional, defaults to `gpt-6.1-sol`)
   - `OPENAI_SUMMARY_REASONING_EFFORT` (optional, defaults to `low`)
   - `OPENAI_CLASSIFICATION_REASONING_EFFORT` (optional, defaults to `high`)
   - `NCBI_API_KEY` (optional, improves NCBI throughput)
@@ -52,7 +53,7 @@ This script expects access to shared project data on the lab storage mount:
 - macOS: `/Volumes/umms-rallada`
 - ARC/HPC Linux: `/nfs/turbo/umms-rallada`
 
-It uses shared FlyBase reference files and shared PubMed/full-text caches under that mount. Human and mouse modes also use cached HGNC/MGI, NCBI, GeneRIF, UniProt, and DIOPT data.
+It uses shared FlyBase reference files and shared PubMed/full-text caches under that mount. The FlyBase Chado XML download and its citation index live in the repo-local, gitignored `Data/FlyBase_Chado/` folder. Human and mouse modes also use cached HGNC/MGI, NCBI, GeneRIF, UniProt, and DIOPT data.
 
 ## Install
 
@@ -72,6 +73,23 @@ python flai_gene_classification.py prepare /path/to/input_dir \
 ```
 
 This single-writer preparation step converts input fly symbols to `FBgn` IDs and validates the source CSVs. After preparation, classification jobs can skip source CSV mutation.
+
+### How Fly Symbols Become FBgn IDs
+
+`GetFBgnIDs.py` (also run by the preparation step) maps each symbol **exactly as written**; it never edits your gene column and never calls OpenAI or any web API. Matching is case-sensitive, in this order:
+
+1. The current symbol in the FlyBase synonym table.
+2. A symbol synonym in that table (`mapping_note`: `matched via synonym of <symbol>`).
+3. If several genes share the synonym (e.g. `Trh`), the gene whose symbol FlyBase publications use most, **only when the lead is clear** (at least 3 publications and 2x the runner-up). The note lists the counts, e.g. `synonym shared by 3 genes; FlyBase citations: Trhn 41, trh 6, Hn 2 → Trhn`. Otherwise `flybase_gene_id` is `-` and the note lists every candidate: `ambiguous synonym: ...`.
+4. Only if nothing matched, Greek letters are spelled out in a lookup key (`14-3-3ζ` -> `14-3-3zeta`) because FlyBase's table spells them out; the note says so.
+
+Step 3 reads a local citation index built once from the FlyBase Chado XML gene file (about 6 GB download, stored under `Data/FlyBase_Chado/`, which is gitignored):
+
+```bash
+python HelperScripts/build_synonym_evidence.py
+```
+
+Without the index, shared synonyms stay unmapped and the note says to build it. The thresholds are `MIN_WINNER_PUBS` and `WIN_RATIO` in `HelperScripts/flybase_synonym_evidence.py`.
 
 ### Fly Literature
 
@@ -94,6 +112,25 @@ python flai_gene_classification.py classify /path/to/input_dir \
 ```
 
 The pipeline writes `Human/<input_name>_human.csv` files containing the fly-to-human DIOPT crosswalk, then classifies each unique human ortholog and exports `Human/<input_name>_human_classification.xlsx`.
+
+### Native Human Genes
+
+For a CSV containing human symbols, use matching input and target species. The native path does not run FlyBase conversion, DIOPT, or emit fly-trace columns:
+
+```bash
+python flai_gene_classification.py prepare /path/to/human_input \
+  --species human \
+  --input-species human \
+  --input-gene-col human_gene_symbol
+
+python flai_gene_classification.py classify /path/to/human_input \
+  --species human \
+  --input-species human \
+  --keywords "sleep,circadian,Alzheimer" \
+  --reference-limit 300
+```
+
+The native human input must contain `human_entrez_gene_id` after `prepare` (or provide a resolvable symbol column to `prepare`). Native output is written as `<input_name>_human_classification.xlsx`.
 
 ### Fly to Mouse Orthologs
 
@@ -154,7 +191,7 @@ Each output workbook includes:
 
 - `Gene Set`: the full input gene set and, for ortholog modes, the fly-to-human or fly-to-mouse crosswalk. Unmapped fly genes are included with `Status = unmapped`.
 - `Classification`: one row per classified species-specific gene.
-- `Reference Summaries`: high-quality reference summaries with source labels and fly traceability columns for ortholog modes.
+- `Reference Summaries`: high-quality reference summaries with source labels; fly traceability columns are included only for fly-to-human or fly-to-mouse ortholog modes.
 
 Optional:
 
@@ -165,6 +202,6 @@ Optional:
 
 - The input path should be a directory containing one or more CSV files.
 - Each CSV is treated as an independent gene set.
-- The gene symbol column defaults to `ext_gene`, but can be changed with `--input-gene-col`.
+- Fly input symbols default to `ext_gene`; native human and mouse runs can use a configured symbol column with `--input-gene-col`.
 - Output workbooks are written next to each input file as `<input_name>_classification.xlsx`, `<input_name>_human_classification.xlsx`, or `<input_name>_mouse_classification.xlsx`.
 

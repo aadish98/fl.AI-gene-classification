@@ -68,8 +68,8 @@ try:
 except ImportError:  # pragma: no cover - fcntl is available on macOS/Linux HPC.
     fcntl = None
 
-DEFAULT_SUMMARY_MODEL = "gpt-5.4-nano"
-DEFAULT_CLASSIFICATION_MODEL = "gpt-5.4"
+DEFAULT_SUMMARY_MODEL = "gpt-6-luna"
+DEFAULT_CLASSIFICATION_MODEL = "gpt-6.1-sol"
 DEFAULT_SUMMARY_REASONING_EFFORT = "medium"
 DEFAULT_CLASSIFICATION_REASONING_EFFORT = "high"
 OPENAI_PRICING_CSV_PATH = PROJECT_ROOT / "Data" / "openai_pricing.csv"
@@ -267,22 +267,32 @@ def _save_soft_run_system_profiles(payload: dict[str, Any]):
 
 
 def _resolve_soft_run_reference_profile(summary_model: str, classification_model: str) -> Optional[dict[str, object]]:
-    """Return empirical token averages for a known soft-run model pair, if available."""
+    """Return empirical token averages for a model pair, else the model-independent default profile.
+
+    Token counts depend on the prompts and papers rather than the model, so the default
+    profile is repriced at the current models' rates by `_estimate_costs`.
+    """
     key = (
         _normalize_pricing_model_name(summary_model),
         _normalize_pricing_model_name(classification_model),
     )
     payload = _load_soft_run_system_profiles()
     profiles = payload.get("profiles", []) if isinstance(payload, dict) else []
+    default_profile: Optional[dict[str, object]] = None
     for profile in profiles:
         if not isinstance(profile, dict):
+            continue
+        if profile.get("default"):
+            default_profile = profile
             continue
         profile_key = (
             _normalize_pricing_model_name(str(profile.get("summary_model", "") or "")),
             _normalize_pricing_model_name(str(profile.get("classification_model", "") or "")),
         )
         if profile_key == key:
-            return profile
+            return {**profile, "model_pair_matched": True}
+    if default_profile is not None:
+        return {**default_profile, "model_pair_matched": False}
     return None
 
 
@@ -2150,10 +2160,11 @@ def _get_reasoning_config(
     model_name: str,
     reasoning_effort: Optional[str] = None,
 ) -> Optional[dict[str, str]]:
-    """Use Responses API reasoning controls for GPT-5 family models when configured."""
+    """Use Responses API reasoning controls for GPT-5+ family models when configured."""
     model = str(model_name or "").strip().lower()
     effort = str(reasoning_effort or "").strip().lower()
-    if model.startswith("gpt-5") and effort:
+    family = re.match(r"gpt-(\d+)", model)
+    if family and int(family.group(1)) >= 5 and effort:
         return {"effort": effort}
     return None
 
@@ -3231,6 +3242,12 @@ def _print_soft_run_report(estimate: SoftRunEstimate):
     if average_profile:
         print("\nEmpirical reference-average profile:")
         print(f"  {average_profile.get('label', 'unnamed profile')}")
+        if not average_profile.get("model_pair_matched", True):
+            print(
+                "  Token averages from the model-independent default profile "
+                f"({int(_to_float(average_profile.get('observed_references'))):,} refs); "
+                "repriced at current model rates. Reasoning-token usage may differ."
+            )
         print(f"  Source: {average_profile.get('source', 'unknown')}")
         print(
             "  Per reference: "
@@ -3335,7 +3352,15 @@ def _print_soft_run_report(estimate: SoftRunEstimate):
     print(f"{'='*70}")
 
 
-def generate_excel_output(gene_hits, all_summaries, validated, output_path, gene_set_df=None, adapter: SpeciesAdapter | None = None):
+def generate_excel_output(
+    gene_hits,
+    all_summaries,
+    validated,
+    output_path,
+    gene_set_df=None,
+    adapter: SpeciesAdapter | None = None,
+    native: bool = False,
+):
     """Generate species-aware Excel output with Gene Set, Classification, and Reference Summaries sheets."""
     import pandas as pd
     from openpyxl.styles import Alignment, PatternFill, Font
@@ -3358,7 +3383,7 @@ def generate_excel_output(gene_hits, all_summaries, validated, output_path, gene
         species_key = records[0].species if records else "fly"
         adapter = get_species_adapter(species_key)
 
-    pmcid_to_year = build_pmcid_to_year()
+    pmcid_to_year = build_pmcid_to_year() if adapter.key == "fly" else {}
     
     def _sort_refs_by_recency(refs_set):
         return sorted(refs_set, key=lambda p: (-pmcid_to_year.get(str(p).upper(), 0), str(p)))
@@ -3390,7 +3415,7 @@ def generate_excel_output(gene_hits, all_summaries, validated, output_path, gene
             "Confidence": info.get("confidence", 0),
             "Rationale": info.get("rationale", ""),
         })
-        if adapter.key != "fly":
+        if adapter.key != "fly" and not native:
             row.update({
                 "Fly_Gene_symbol_primary": _trace(record, "fly_gene_symbol_primary"),
                 "Fly_Gene_symbol_input": _trace(record, "fly_gene_symbol_input"),
@@ -3409,6 +3434,12 @@ def generate_excel_output(gene_hits, all_summaries, validated, output_path, gene
         class_cols = [
             "Fly_Gene_symbol", "FlyBase_ID", "Category", "Confidence", "Rationale",
             "Supporting_Refs", "Papers_w_full_text", "Queried_Refs"
+        ]
+    elif native:
+        class_cols = [
+            adapter.symbol_column, adapter.authority_id_column, adapter.gene_id_column,
+            "Category", "Confidence", "Rationale",
+            "Supporting_Refs", "Papers_w_full_text", "Queried_Refs",
         ]
     else:
         class_cols = [
@@ -3468,6 +3499,12 @@ def generate_excel_output(gene_hits, all_summaries, validated, output_path, gene
                 "Gene": gene_sym,
                 "Gene_ID": gene_id,
             }
+        elif native:
+            row = {
+                adapter.symbol_column: gene_sym,
+                adapter.authority_id_column: sd.get("authority_id", ""),
+                adapter.gene_id_column: gene_id,
+            }
         else:
             trace = sd.get("trace", {}) or {}
             row = {
@@ -3493,6 +3530,12 @@ def generate_excel_output(gene_hits, all_summaries, validated, output_path, gene
     if adapter.key == "fly":
         ref_cols = [
             "Gene", "Gene_ID", "Paper_ID", "Title", "Year", "_year_sort",
+            "Journal", "Author(s)", "Reference Summary", "Abstract", "Classification", "Source",
+        ]
+    elif native:
+        ref_cols = [
+            adapter.symbol_column, adapter.authority_id_column, adapter.gene_id_column,
+            "Paper_ID", "Title", "Year", "_year_sort",
             "Journal", "Author(s)", "Reference Summary", "Abstract", "Classification", "Source",
         ]
     else:
@@ -3872,7 +3915,12 @@ def _normalize_gene_id_value(value: object, adapter: SpeciesAdapter) -> str:
     return text
 
 
-def _gene_records_from_df(df: pd.DataFrame, adapter: SpeciesAdapter, input_gene_col: str = "ext_gene") -> list[GeneRecord]:
+def _gene_records_from_df(
+    df: pd.DataFrame,
+    adapter: SpeciesAdapter,
+    input_gene_col: str = "ext_gene",
+    native: bool = False,
+) -> list[GeneRecord]:
     catalog = adapter.load_gene_catalog()
     id_col = _input_id_column_for_adapter(adapter)
     if id_col not in df.columns:
@@ -3921,7 +3969,7 @@ def _gene_records_from_df(df: pd.DataFrame, adapter: SpeciesAdapter, input_gene_
                 authority_id=authority_id,
                 synonyms={symbol} if symbol else set(),
             )
-        if adapter.key != "fly":
+        if adapter.key != "fly" and not native:
             incoming_trace = {
                 "fly_gene_symbol_input": str(row.get("fly_gene_symbol_input", "") or ""),
                 "fly_gene_symbol_primary": str(row.get("fly_gene_symbol_primary", "") or ""),
@@ -3951,6 +3999,7 @@ def process_csv_file(
     diopt_filter: str = "",
     input_gene_col: str = "ext_gene",
     force_all: bool = False,
+    native: bool = False,
 ):
     """Process a single CSV file containing species-specific gene IDs."""
     adapter = adapter or get_species_adapter("fly")
@@ -3972,7 +4021,9 @@ def process_csv_file(
         return False
 
     log_step("Resolving input rows to gene records", f"id column={id_col}", indent=1)
-    gene_records = _gene_records_from_df(df, adapter, input_gene_col=input_gene_col)
+    gene_records = _gene_records_from_df(
+        df, adapter, input_gene_col=input_gene_col, native=native
+    )
     if not gene_records:
         print(f"Skipping: No valid {adapter.display_name} gene IDs found")
         return False
@@ -4135,10 +4186,18 @@ def process_csv_file(
 
     # Generate one final output Excel per input CSV.
     base_name = os.path.splitext(csv_path)[0]
-    output_path = f"{base_name}_classification.xlsx"
+    output_path = f"{base_name}{adapter.output_suffix}" if native else f"{base_name}_classification.xlsx"
     log_step("Generating final workbook", output_path, indent=1)
     
-    generate_excel_output(gene_hits, all_summaries, validated, output_path, gene_set_df=df, adapter=adapter)
+    generate_excel_output(
+        gene_hits,
+        all_summaries,
+        validated,
+        output_path,
+        gene_set_df=df,
+        adapter=adapter,
+        native=native,
+    )
 
     if calibration_totals["limited_references"] > 0:
         updated = _maybe_update_species_keyword_pass_rate(
@@ -4172,6 +4231,7 @@ def soft_run_csv_file(
     diopt_filter: str = "",
     input_gene_col: str = "ext_gene",
     force_all: bool = False,
+    native: bool = False,
 ) -> Optional[SoftRunFileEstimate]:
     """Estimate OpenAI-bound work for a CSV without OpenAI or full-text calls."""
     adapter = adapter or get_species_adapter("fly")
@@ -4192,7 +4252,9 @@ def soft_run_csv_file(
         return None
 
     log_step("Resolving input rows to gene records", f"id column={id_col}", indent=1)
-    gene_records = _gene_records_from_df(df, adapter, input_gene_col=input_gene_col)
+    gene_records = _gene_records_from_df(
+        df, adapter, input_gene_col=input_gene_col, native=native
+    )
     if not gene_records:
         print(f"Skipping: No valid {adapter.display_name} gene IDs found")
         return None
@@ -4354,6 +4416,110 @@ def validate_source_csvs(input_directory: str, input_gene_col: str = "ext_gene")
     return ok
 
 
+def prepare_native_source_csvs(
+    input_directory: str,
+    adapter: SpeciesAdapter,
+    input_gene_col: str,
+) -> bool:
+    """Resolve native species symbols to catalog IDs and write them into CSVs."""
+    csv_files = _source_csv_files(input_directory)
+    if not csv_files:
+        print(f"No source CSV files found in {input_directory}")
+        return False
+    catalog = adapter.load_gene_catalog()
+    id_col = _input_id_column_for_adapter(adapter)
+    symbol_col = _input_symbol_column_for_adapter(adapter)
+    authority_col = "hgnc_id" if adapter.key == "human" else "mgi_id"
+    ok = True
+    for csv_path in sorted(csv_files):
+        try:
+            df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+        except Exception as e:
+            print(f"Error reading native CSV {csv_path}: {e}")
+            ok = False
+            continue
+        if input_gene_col not in df.columns and symbol_col not in df.columns and id_col not in df.columns:
+            print(
+                f"Native CSV requires '{input_gene_col}', '{symbol_col}', or '{id_col}': {csv_path}"
+            )
+            ok = False
+            continue
+        source_col = symbol_col if symbol_col in df.columns else input_gene_col
+        if id_col not in df.columns:
+            df[id_col] = ""
+        if symbol_col not in df.columns:
+            df[symbol_col] = ""
+        if authority_col not in df.columns:
+            df[authority_col] = ""
+        unresolved = []
+        for idx, row in df.iterrows():
+            gene_id = _normalize_gene_id_value(row.get(id_col, ""), adapter)
+            symbol = str(row.get(source_col, "") or "").strip()
+            record = catalog.get(gene_id) if gene_id else catalog.from_symbol(symbol)
+            if record is None:
+                if symbol or gene_id:
+                    unresolved.append(f"{idx + 2}:{symbol or gene_id}")
+                continue
+            df.at[idx, id_col] = record.gene_id
+            df.at[idx, symbol_col] = record.symbol
+            df.at[idx, authority_col] = record.authority_id
+        if unresolved:
+            print(
+                f"Unresolved native {adapter.display_name} genes in {Path(csv_path).name}: "
+                + ", ".join(unresolved[:20])
+                + (" ..." if len(unresolved) > 20 else "")
+            )
+        tmp_path = Path(csv_path).with_suffix(".native.tmp.csv")
+        try:
+            df.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+            os.replace(tmp_path, csv_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        print(
+            f"Prepared native {Path(csv_path).name}: rows={len(df)}, "
+            f"resolved={int(df[id_col].astype(str).str.strip().ne('').sum())}"
+        )
+        if unresolved:
+            ok = False
+    return ok
+
+
+def validate_native_source_csvs(
+    input_directory: str,
+    adapter: SpeciesAdapter,
+    input_gene_col: str,
+) -> bool:
+    """Validate source CSVs for a native species run."""
+    csv_files = _source_csv_files(input_directory)
+    if not csv_files:
+        print(f"No source CSV files found in {input_directory}")
+        return False
+    id_col = _input_id_column_for_adapter(adapter)
+    symbol_col = _input_symbol_column_for_adapter(adapter)
+    ok = True
+    for csv_path in sorted(csv_files):
+        try:
+            df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+        except Exception as e:
+            print(f"Error reading native CSV {csv_path}: {e}")
+            ok = False
+            continue
+        if id_col not in df.columns:
+            print(f"Native CSV missing required column '{id_col}': {csv_path}")
+            ok = False
+            continue
+        valid_ids = df[id_col].astype(str).str.strip().ne("")
+        if not valid_ids.any():
+            print(f"Native CSV has no valid {adapter.display_name} IDs: {csv_path}")
+            ok = False
+            continue
+        print(
+            f"Validated native {Path(csv_path).name}: rows={len(df)}, "
+            f"valid_{adapter.key}_ids={int(valid_ids.sum())}"
+        )
+    return ok
+
+
 def _parse_config_value(raw: str) -> Any:
     text = str(raw or "").strip()
     if not text:
@@ -4399,6 +4565,7 @@ def _apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.keywords = ",".join(str(item).strip() for item in args.keywords if str(item).strip())
     args.reference_limit = int(pick("reference_limit", 500))
     args.input_gene_col = str(pick("input_gene_col", "ext_gene"))
+    args.input_species = str(pick("input_species", "fly") or "fly").strip().lower()
     args.diopt_filter = str(pick("diopt_filter", "exclude_low_score_2"))
     args.diopt_workers = int(pick("diopt_workers", 8))
     args.diopt_cache_dir = str(pick("diopt_cache_dir", os.environ.get("FLAI_DIOPT_CACHE_DIR", "")))
@@ -4411,8 +4578,13 @@ def _apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
 def _add_common_args(parser: argparse.ArgumentParser, *, include_species: bool = False):
     parser.add_argument("input_directory", help="Directory containing input CSV files")
     parser.add_argument("--config", default="", help="Optional JSON or simple YAML config file.")
-    if include_species:
-        parser.add_argument("--species", choices=["fly", "human", "mouse"], default="fly")
+    parser.add_argument("--species", choices=["fly", "human", "mouse"], default=None)
+    parser.add_argument(
+        "--input-species",
+        choices=["fly", "human", "mouse"],
+        default=None,
+        help="Species represented by input CSVs; matching --species enables native mode.",
+    )
     parser.add_argument("--keywords", "-k", default=None)
     parser.add_argument("--reference-limit", "-r", type=int, default=None)
     parser.add_argument("--input-gene-col", default=None)
@@ -4432,7 +4604,7 @@ def _parse_new_cli(argv: list[str]) -> argparse.Namespace:
         description="fl.AI gene classification pipeline",
     )
     subparsers = parser.add_subparsers(dest="action", required=True)
-    prepare = subparsers.add_parser("prepare", help="Run FBgn conversion and validate source CSVs.")
+    prepare = subparsers.add_parser("prepare", help="Prepare and validate source CSVs.")
     _add_common_args(prepare)
     classify = subparsers.add_parser("classify", help="Classify prepared source CSVs.")
     _add_common_args(classify, include_species=True)
@@ -4455,8 +4627,14 @@ def _parse_new_cli(argv: list[str]) -> argparse.Namespace:
     args.soft_run = args.action == "estimate"
     args.prepare_only = args.action == "prepare"
     args.skip_fbgn_conversion = args.action in {"classify", "estimate"}
-    species = getattr(args, "species", "fly")
-    args.orthologs = "none" if species == "fly" else species
+    input_species = args.input_species
+    species = getattr(args, "species", None) or input_species or "fly"
+    args.species = str(species).strip().lower()
+    args.native = input_species == args.species and args.species != "fly"
+    if input_species != "fly" and input_species != args.species:
+        parser.error("--input-species must match --species for native mode")
+    args.adapter_key = args.species
+    args.orthologs = "none" if args.native or args.species == "fly" else args.species
     return args
 
 
@@ -4472,6 +4650,13 @@ def _parse_legacy_cli(argv: list[str]) -> argparse.Namespace:
         help="Directory containing input CSV files for FBgn conversion and classification"
     )
     parser.add_argument("--config", default="", help="Optional JSON or simple YAML config file.")
+    parser.add_argument("--species", choices=["fly", "human", "mouse"], default=None)
+    parser.add_argument(
+        "--input-species",
+        choices=["fly", "human", "mouse"],
+        default=None,
+        help="Species represented by input CSVs; matching --species enables native mode.",
+    )
     parser.add_argument(
         "--keywords", "-k",
         default=None,
@@ -4565,6 +4750,14 @@ def _parse_legacy_cli(argv: list[str]) -> argparse.Namespace:
     )
     args = _apply_config_defaults(args)
     args.action = "prepare" if args.prepare_only else ("estimate" if args.soft_run else "classify")
+    input_species = args.input_species
+    args.species = str(args.species or ("fly" if args.orthologs == "none" else args.orthologs)).strip().lower()
+    args.native = input_species == args.species and args.species != "fly"
+    if input_species != "fly" and input_species != args.species:
+        parser.error("--input-species must match --species for native mode")
+    args.adapter_key = args.species
+    if args.native:
+        args.orthologs = "none"
     return args
 
 
@@ -4583,43 +4776,66 @@ def _execute_pipeline(args: argparse.Namespace) -> int:
         print(f"Shared lab data root is not accessible: {SHARED_DATA_ROOT}")
         print(f"Using local data fallback: {FLYBASE_DATA}")
 
-    log_step("Checking FlyBase data files", str(FLYBASE_DATA))
-    missing_flybase = ensure_flybase_data_files(FLYBASE_DATA, download_missing=True)
-    if missing_flybase:
-        print(f"Error: FlyBase data files are still missing under: {FLYBASE_DATA}")
-        print("Expected structure:")
-        print(f"  {FLYBASE_DATA}/Genes/fb_synonym_fb_*.tsv[.gz]")
-        print(f"  {FLYBASE_DATA}/FlyBase_References/entity_publication_fb_*.tsv[.gz]")
-        print(f"  {FLYBASE_DATA}/FlyBase_References/fbrf_pmid_pmcid_doi_fb_*.tsv[.gz]")
-        print("Could not retrieve:")
-        for requirement in missing_flybase:
-            print(f"  - {requirement['label']}: {requirement['url']}")
-        return 1
+    if not args.native:
+        log_step("Checking FlyBase data files", str(FLYBASE_DATA))
+        missing_flybase = ensure_flybase_data_files(FLYBASE_DATA, download_missing=True)
+        if missing_flybase:
+            print(f"Error: FlyBase data files are still missing under: {FLYBASE_DATA}")
+            print("Expected structure:")
+            print(f"  {FLYBASE_DATA}/Genes/fb_synonym_fb_*.tsv[.gz]")
+            print(f"  {FLYBASE_DATA}/FlyBase_References/entity_publication_fb_*.tsv[.gz]")
+            print(f"  {FLYBASE_DATA}/FlyBase_References/fbrf_pmid_pmcid_doi_fb_*.tsv[.gz]")
+            print("Could not retrieve:")
+            for requirement in missing_flybase:
+                print(f"  - {requirement['label']}: {requirement['url']}")
+            return 1
     
     # Parse keywords
     keywords_list = [k.strip() for k in args.keywords.split(",") if k.strip()]
     
     print(f"\n{'='*70}")
-    print("Fly Gene Classification Pipeline (Standalone)")
+    print("fl.AI Gene Classification Pipeline (Standalone)")
     print(f"{'='*70}")
     print(f"Input directory: {args.input_directory}")
     print(f"Keywords: {keywords_list if keywords_list else '(none)'}")
     print(f"Reference limit: {args.reference_limit}")
     print(f"Batch size: {BATCH_SIZE} (automatic)")
-    print(f"FlyBase data: {FLYBASE_DATA}")
-    pubmed_db = _get_pubmed_cache_db()
-    print(f"PubMed cache DB: {pubmed_db.path} ({pubmed_db.source})")
+    print(f"Input species: {args.input_species}")
+    print(f"Target species: {args.species}")
+    if not args.native:
+        print(f"FlyBase data: {FLYBASE_DATA}")
+    if not args.prepare_only:
+        pubmed_db = _get_pubmed_cache_db()
+        print(f"PubMed cache DB: {pubmed_db.path} ({pubmed_db.source})")
     print(f"Force all: {'yes' if args.force_all else 'no'}")
     print(f"Soft run: {'yes' if args.soft_run else 'no'}")
+    print(f"Native mode: {'yes' if args.native else 'no'}")
     print(f"Ortholog mode: {args.orthologs}")
     print(f"DIOPT filter: {args.diopt_filter}")
     if args.orthologs != "none":
         print(f"DIOPT workers: {max(1, args.diopt_workers)}")
-    print(f"Run FBgnID conversion: {'no' if args.skip_fbgn_conversion else 'yes'}")
-    print(f"FBgn conversion input gene column: {args.input_gene_col}")
+    if not args.native:
+        print(f"Run FBgnID conversion: {'no' if args.skip_fbgn_conversion else 'yes'}")
+        print(f"FBgn conversion input gene column: {args.input_gene_col}")
 
-    # Step 0: convert input symbols to FBgn IDs, or validate an already prepared folder.
-    if args.skip_fbgn_conversion:
+    # Step 0: prepare/validate native IDs or convert/validate fly IDs.
+    if args.native:
+        if args.prepare_only:
+            log_step(f"Preparing native {args.species} source CSVs")
+            human_gene_data.configure(args.human_data_dir or None, refresh=args.refresh_human_data)
+            mouse_gene_data.configure(args.mouse_data_dir or None, refresh=args.refresh_mouse_data)
+            adapter_for_prepare = get_species_adapter(args.adapter_key)
+            ok = prepare_native_source_csvs(
+                args.input_directory, adapter_for_prepare, args.input_gene_col
+            )
+        else:
+            log_step(f"Validating prepared native {args.species} source CSVs")
+            ok = validate_native_source_csvs(
+                args.input_directory,
+                get_species_adapter(args.adapter_key),
+                args.input_gene_col,
+            )
+    elif args.skip_fbgn_conversion:
         log_step("Validating prepared source CSVs")
         ok = validate_source_csvs(args.input_directory, args.input_gene_col)
     else:
@@ -4674,7 +4890,7 @@ def _execute_pipeline(args: argparse.Namespace) -> int:
     human_gene_data.configure(args.human_data_dir or None, refresh=args.refresh_human_data)
     mouse_gene_data.configure(args.mouse_data_dir or None, refresh=args.refresh_mouse_data)
 
-    adapter = get_species_adapter("fly" if args.orthologs == "none" else args.orthologs)
+    adapter = get_species_adapter(args.adapter_key)
     log_step(
         "Using species-strict prompt cache schema",
         f"v{CACHE_SCHEMA_VERSION}; cached summaries from older schemas will be regenerated",
@@ -4732,6 +4948,7 @@ def _execute_pipeline(args: argparse.Namespace) -> int:
                     diopt_filter=args.diopt_filter if args.orthologs != "none" else "",
                     input_gene_col=args.input_gene_col,
                     force_all=args.force_all,
+                    native=args.native,
                 )
                 if file_estimate is not None:
                     soft_run_estimate.files.append(file_estimate)  # type: ignore[union-attr]
@@ -4750,6 +4967,7 @@ def _execute_pipeline(args: argparse.Namespace) -> int:
                     diopt_filter=args.diopt_filter if args.orthologs != "none" else "",
                     input_gene_col=args.input_gene_col,
                     force_all=args.force_all,
+                    native=args.native,
                 ):
                     success_count += 1
                 else:

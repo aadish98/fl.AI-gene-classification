@@ -1,24 +1,32 @@
 {
   "profiles": [
     {
-      "classification_input_tokens_per_gene": 790.7230769230769,
-      "classification_model": "gpt-5.4",
-      "classification_output_tokens_per_gene": 287.8055944055945,
+      "calibrated_at_utc": "2026-10-07T21:08:21Z",
+      "calibrated_on": "previous default models (see Docs/model_history.md)",
+      "classification_input_tokens_per_gene": 639.2893682588598,
+      "classification_output_tokens_per_gene": 291.6323574730354,
       "classification_requests_per_gene": 1.0,
-      "label": "Tx-Omics conserved-small fly-to-human/mouse calibration",
-      "notes": [
-        "Calibrated from the saved run-store, not from the filtered workbook sheets.",
-        "Output-token split was inferred from combined output tokens, total cost, and model prices for the original run."
+      "default": true,
+      "label": "Model-independent default profile (pooled run telemetry)",
+      "method": "pooled per-request telemetry",
+      "observed_gpt_classifications": 3245,
+      "observed_model_requests": 308621,
+      "observed_references": 100010,
+      "source": "saved run stores under Data/**/.batch_state",
+      "source_runs": [
+        "AD-GWAS-Bellenguez-2022",
+        "Tx-Omics-Conserved-CSW-Large",
+        "Tx-Omics-Conserved-CSW-Large/Set1",
+        "Tx-Omics-Conserved-CSW-Large/Set2",
+        "Tx-Omics-Conserved-Correlates-Large",
+        "Tx-Omics-Conserved-Correlates-Large/Set1",
+        "Tx-Omics-Conserved-Correlates-Large/Set2",
+        "Tx-Omics-Conserved-Medium/Subset1-XS",
+        "Tx-Omics-Conserved-Medium/Subset2-M"
       ],
-      "observed_gpt_classifications": 26,
-      "observed_model_requests": 389,
-      "observed_references": 147,
-      "reference_limit": 50,
-      "source": "Data/Tx-Omics_Conserved-Small",
-      "summary_input_tokens_per_reference": 16095.238095238095,
-      "summary_model": "gpt-5.4-nano",
-      "summary_output_tokens_per_reference": 615.8303030303031,
-      "summary_requests_per_reference": 2.4693877551020407
+      "summary_input_tokens_per_reference": 20847.834396560345,
+      "summary_output_tokens_per_reference": 436.0799120087991,
+      "summary_requests_per_reference": 3.0534546545345465
     }
   ],
   "species_keyword_pass_rates": {
@@ -31,12 +39,12 @@
       "updated_at_utc": "2026-05-05T21:37:17Z"
     },
     "human": {
-      "calibration_limited_references": 107758,
-      "calibration_metadata_keyword_matches": 21133,
-      "keyword_pass_rate": 0.19611536962452902,
-      "reference_limit": 250,
-      "source": "/nfs/turbo/umms-rallada/UM Lab Users/Aadish/fl.AI-gene-classification/Data/Tx-Omics-Conserved-CSW-Large/Human/Sleep gene list FC0.5 Table_human.csv",
-      "updated_at_utc": "2026-05-05T09:34:21Z"
+      "calibration_limited_references": 125783,
+      "calibration_metadata_keyword_matches": 18563,
+      "keyword_pass_rate": 0.14757956162597488,
+      "reference_limit": 150,
+      "source": "/nfs/turbo/umms-rallada/UM Lab Users/Aadish/fl.AI-gene-classification/Data/Tx-Omics-Conserved-CSW-Large/Set1/Human/Wake gene list FC0.5 Table_human.csv",
+      "updated_at_utc": "2026-05-07T15:32:33Z"
     },
     "mouse": {
       "calibration_limited_references": 95878,

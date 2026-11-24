@@ -244,6 +244,106 @@ def summarize_classification(
     return len(classified), len(unclassified), bucket_counts, notes
 
 
+def count_unique_native_genes(csv_path: Path, species: str) -> tuple[int, list[str]]:
+    notes: list[str] = []
+    cfg = SPECIES_CONFIG[species]
+    try:
+        df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    except Exception as exc:
+        return 0, [f"Failed to read CSV: {exc}"]
+    if df.empty:
+        return 0, ["CSV is empty"]
+    id_col = cfg["entrez_col"]
+    symbol_col = cfg["symbol_col"]
+    if id_col in df.columns:
+        values = {_clean(v) for v in df[id_col] if _clean(v)}
+        return len(values), notes
+    if symbol_col in df.columns:
+        values = {_clean(v) for v in df[symbol_col] if _clean(v)}
+        notes.append(f"`{id_col}` missing; counted unique values in `{symbol_col}` instead")
+        return len(values), notes
+    return 0, [f"Neither `{id_col}` nor `{symbol_col}` columns are present"]
+
+
+def build_native_rows(
+    input_dir: Path,
+    *,
+    species: str,
+) -> tuple[list[dict[str, object]], list[str]]:
+    cfg = SPECIES_CONFIG[species]
+    rows: list[dict[str, object]] = []
+    notes: list[str] = []
+    for csv_path in find_original_csvs(input_dir):
+        stem = csv_path.stem
+        unique_count, count_notes = count_unique_native_genes(csv_path, species)
+        notes.extend(f"{stem}: {note}" for note in count_notes)
+        workbook_path = input_dir / f"{stem}{cfg['classification_suffix']}"
+        if workbook_path.exists():
+            classified, unclassified, buckets, class_notes = summarize_classification(
+                workbook_path, cfg
+            )
+            notes.extend(f"{stem}: {note}" for note in class_notes)
+        else:
+            classified, unclassified, buckets = 0, 0, {}
+            notes.append(f"{stem}: classification workbook not found: {workbook_path.name}")
+        rows.append({
+            "Gene Set": stem,
+            "Pipeline": f"Native {cfg['label']}",
+            "Step 1: Original Human Gene Set" if species == "human" else "Step 1: Original Gene Set":
+                f"{unique_count} unique {cfg['label'].lower()} genes",
+            "Step 2: Classification": (
+                f"{classified} classified into bucket(s)\n"
+                f"{unclassified} unclassified / no bucket"
+            ),
+            "Step 3: Classified Buckets": (
+                "\n".join(f"{bucket}: {count}" for bucket, count in sorted(
+                    buckets.items(), key=lambda item: (-item[1], item[0].lower())
+                )) or "No classified bucket counts available"
+            ),
+        })
+    return rows, notes
+
+
+def write_native_summary_workbook(
+    rows: list[dict[str, object]],
+    output_path: Path,
+    species: str,
+) -> None:
+    columns = [
+        "Gene Set",
+        "Pipeline",
+        "Step 1: Original Human Gene Set" if species == "human" else "Step 1: Original Gene Set",
+        "Step 2: Classification",
+        "Step 3: Classified Buckets",
+    ]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Summary"
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(columns))
+    title = ws.cell(row=1, column=1)
+    title.value = f"Gene Set Summary: Native {SPECIES_CONFIG[species]['label']} Pipeline"
+    title.font = Font(color="FFFFFF", bold=True, size=18)
+    title.fill = PatternFill(start_color="17365D", end_color="17365D", fill_type="solid")
+    title.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+    ws.append(columns)
+    for cell in ws[2]:
+        cell.font = Font(color="FFFFFF", bold=True, size=14)
+        cell.fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    for row in rows:
+        ws.append([row.get(column, "") for column in columns])
+        for cell in ws[ws.max_row]:
+            cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    widths = [32, 20, 30, 36, 40]
+    for idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+    ws.row_dimensions[2].height = 42
+    ws.freeze_panes = "A3"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output_path)
+
+
 def resolve_species_dir(
     input_dir: Path,
     species_cfg: dict,
@@ -497,6 +597,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "both human and mouse are included."
         ),
     )
+    parser.add_argument(
+        "--species",
+        choices=sorted(SPECIES_CONFIG.keys()),
+        default=None,
+        help="Native input species when --native is set.",
+    )
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        help="Summarize a native species input without an ortholog-mapping step.",
+    )
     return parser.parse_args(argv)
 
 
@@ -506,6 +617,27 @@ def main(argv: list[str] | None = None) -> int:
     if not input_dir.is_dir():
         print(f"Error: input directory does not exist: {input_dir}", file=sys.stderr)
         return 1
+
+    if args.native:
+        species = args.species or args.ortholog or "human"
+        rows, notes = build_native_rows(input_dir, species=species)
+        if not rows:
+            print(f"No original gene-set CSVs found in {input_dir}", file=sys.stderr)
+            return 1
+        output_name = args.output or f"summary_{species}.xlsx"
+        output_path = (
+            Path(output_name) if Path(output_name).is_absolute() else (input_dir / output_name)
+        )
+        write_native_summary_workbook(rows, output_path, species)
+        print(f"Summary written: {output_path}")
+        for row in rows:
+            print(
+                f"  {row['Gene Set']}: {row.get('Step 1: Original Human Gene Set', row.get('Step 1: Original Gene Set', ''))} | "
+                f"{row['Step 2: Classification']}"
+            )
+        for note in notes:
+            print(f"  Note: {note}")
+        return 0
 
     human_dir = Path(args.human_dir).expanduser().resolve() if args.human_dir else None
     mouse_dir = Path(args.mouse_dir).expanduser().resolve() if args.mouse_dir else None

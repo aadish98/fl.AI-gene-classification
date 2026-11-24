@@ -24,7 +24,13 @@ FLYBASE_REQUIRED_FILES = [
         "label": "FlyBase synonyms",
         "subdir": "Genes",
         "pattern": "fb_synonym",
-        "url": "https://s3ftp.flybase.org/releases/current/precomputed_files/synonyms/fb_synonym_fb_2026_01.tsv.gz",
+        "url": "https://s3ftp.flybase.org/releases/FB2026_03/precomputed_files/synonyms/fb_synonym_fb_2026_03.tsv.gz",
+    },
+    {
+        "label": "FlyBase annotation IDs",
+        "subdir": "Genes",
+        "pattern": "fbgn_annotation_ID",
+        "url": "https://s3ftp.flybase.org/releases/current/precomputed_files/genes/fbgn_annotation_ID_fb_2026_03.tsv.gz",
     },
     {
         "label": "FlyBase entity-publication associations",

@@ -92,28 +92,25 @@ the fixed soft-run constants above remain conservative for budgeting.
 
 ## Empirical Reference Averages
 
-When a matching calibration profile is available for the selected summary and classification models, soft-run also prints a reference-average planning estimate alongside the cap-based upper bound.
+When a calibration profile is available, soft-run also prints a reference-average planning estimate alongside the cap-based upper bound.
 
 Calibration profiles live in `.flai_system/soft_run_reference_profiles.json`. They are project-level system calibration inputs, not run outputs, so they are kept outside `Data/`.
 
-The first profile is based on the saved `Data/Tx-Omics_Conserved-Small` fly-to-human and fly-to-mouse runs with `--reference-limit 50`, using `gpt-5.4-nano` for reference summarization and `gpt-5.4` for gene classification. Across both runs:
+Profile selection:
 
-- 147 references were queried by the summarization stage.
-- 26 genes reached GPT classification.
-- 389 total model requests were made.
-- `gpt-5.4-nano` used 2,366,000 input tokens.
-- `gpt-5.4` used 20,558.8 input tokens.
-- The combined run used 98,010 output tokens and cost about $0.75.
+1. A profile keyed on the exact configured (summary model, classification model) pair, if one exists.
+2. Otherwise the model-independent default profile (`"default": true`). Token counts depend on the prompts and papers rather than the model, so the default profile is repriced at the current models' rates, and the report says so.
+3. If neither exists, only the upper-bound estimate is printed.
 
-Those observations produce these planning averages:
+The default profile is pooled from per-request telemetry in 10 saved run stores (100,010 references, 3,245 classified genes):
 
-- Summary requests per queried reference: 2.47.
-- Summary input tokens per queried reference: 16,095.
-- Summary output tokens per queried reference: 616.
-- Classification input tokens per GPT-classified gene: 791.
-- Classification output tokens per GPT-classified gene: 288.
+- Summary requests per queried reference: 3.05.
+- Summary input tokens per queried reference: 20,848.
+- Summary output tokens per queried reference: 436.
+- Classification input tokens per GPT-classified gene: 639.
+- Classification output tokens per GPT-classified gene: 292.
 
-The output split is inferred from the total cost and the model prices used for that run, so it should be treated as a practical planning average rather than exact telemetry.
+Rebuild it with `HelperScripts/calibrate_soft_run_profile.py` (`--dry-run` to preview). When run stores exist for the currently configured model pair, the script writes a profile keyed on that pair instead. Output tokens include reasoning tokens, which differ by model, so a pair-specific profile is more accurate once available. The earlier profile and the models it was measured on are in [`model_history.md`](model_history.md).
 
 New real runs record successful per-request OpenAI usage in `.batch_state/run_store.json` under each cached gene record:
 
@@ -121,7 +118,7 @@ New real runs record successful per-request OpenAI usage in `.batch_state/run_st
 - `openai_usage.totals`: per-gene aggregate request count and token totals.
 - `summaries[].chunk_count` and `summaries[].chunk_word_counts`: per-reference full-text chunking metrics used to explain why actual reference input can exceed the fixed soft-run constant.
 
-These fields allow future calibration profiles to use direct per-request telemetry instead of inferring model-level output tokens from total cost.
+These fields are what `HelperScripts/calibrate_soft_run_profile.py` reads to build calibration profiles.
 
 ## Token Totals
 
@@ -190,10 +187,10 @@ Assume:
 - $\tau^{\text{out}}_{\text{ref}} = 1200$
 - $\tau^{\text{in}}_{\text{cls}} = 2000$
 - $\tau^{\text{out}}_{\text{cls}} = 4000$
-- $p^{\text{in}}_{s} = 0.20$
-- $p^{\text{out}}_{s} = 1.25$
-- $p^{\text{in}}_{c} = 2.50$
-- $p^{\text{out}}_{c} = 15.00$
+- $p^{\text{in}}_{s} = 0.10$
+- $p^{\text{out}}_{s} = 0.50$
+- $p^{\text{in}}_{c} = 2.00$
+- $p^{\text{out}}_{c} = 10.00$
 
 Then:
 
@@ -208,25 +205,25 @@ $$
 The cost components are:
 
 $$
-C_{\text{summary,in}} = \frac{100 \cdot 6500}{10^6} \cdot 0.20 = 0.13
+C_{\text{summary,in}} = \frac{100 \cdot 6500}{10^6} \cdot 0.10 = 0.065
 $$
 
 $$
-C_{\text{summary,out}} = \frac{100 \cdot 1200}{10^6} \cdot 1.25 = 0.15
+C_{\text{summary,out}} = \frac{100 \cdot 1200}{10^6} \cdot 0.50 = 0.06
 $$
 
 $$
-C_{\text{classification,in}} = \frac{50 \cdot 2000}{10^6} \cdot 2.50 = 0.25
+C_{\text{classification,in}} = \frac{50 \cdot 2000}{10^6} \cdot 2.00 = 0.20
 $$
 
 $$
-C_{\text{classification,out}} = \frac{50 \cdot 4000}{10^6} \cdot 15.00 = 3.00
+C_{\text{classification,out}} = \frac{50 \cdot 4000}{10^6} \cdot 10.00 = 2.00
 $$
 
 So:
 
 $$
-C = 0.13 + 0.15 + 0.25 + 3.00 = 3.53
+C = 0.065 + 0.06 + 0.20 + 2.00 = 2.325
 $$
 
-In this example, the estimated total upper-bound cost is $3.53.
+In this example, the estimated total upper-bound cost is about $2.33. The same example at the previous defaults' prices is compared in [`model_history.md`](model_history.md).

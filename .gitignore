@@ -27,6 +27,10 @@ logs/
 # Keep runtime data ignored, but allow the bundled OpenAI pricing seed CSV.
 Data/*
 !Data/openai_pricing.csv
+# Large FlyBase Chado XML downloads and the index built from them
+Data/FlyBase_Chado/
+*.xml.gz
+*.dtd
 data/*
 !Data/
 !Data/openai_pricing.csv

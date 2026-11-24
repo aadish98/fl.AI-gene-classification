@@ -16,8 +16,9 @@ gets reused**, and **how to invalidate it**.
 | DIOPT responses | Raw JSON per `(FBgn, taxon, filter)` | `--diopt-cache-dir` ↦ `$FLAI_CACHE_DIR/diopt` ↦ `~/.cache/flai-gene-classification/diopt` | Yes | Delete files; errors auto-expire (TTL) |
 | Species reference data | HGNC/MGI tables, `gene2pubmed.gz`, `generifs_basic.gz`, UniProt TSV | `--{human,mouse}-data-dir` ↦ `$FLAI_CACHE_DIR/{human,mouse}-data` ↦ `~/.cache/flai-gene-classification/{human,mouse}-data` | Yes | `--refresh-human-data` / `--refresh-mouse-data` |
 | FlyBase data | `fb_synonym*`, `entity_publication*`, `fbrf_pmid_pmcid_doi*` TSVs | `--flybase-data-dir` ↦ `$FLYBASE_DATA_DIR` ↦ Turbo `Data/FlyBase` ↦ repo `Data/FlyBase` | Yes, lab-shared | Re-download (handled by `flybase_data.py` bootstrap) |
+| FlyBase Chado XML + citation index | `chado_FBgn.xml.gz` (about 6 GB) and `synonym_evidence_<release>.tsv.gz` (publications per gene per symbol) | repo `Data/FlyBase_Chado/` | No (gitignored) | `python HelperScripts/build_synonym_evidence.py` (resumes the download, rebuilds the index) |
 | OpenAI pricing | Model price table (incl. `cached_input_per_1m`) | `Data/openai_pricing.csv` | Yes (committed) | Soft-run auto-refreshes from LiteLLM JSON |
-| Soft-run profiles | Empirical token averages + per-species keyword pass rates | `.flai_system/soft_run_reference_profiles.json` | Yes (committed) | Auto-updated when a real run sees more references than the stored calibration |
+| Soft-run profiles | Empirical token averages + per-species keyword pass rates | `.flai_system/soft_run_reference_profiles.json` | Yes (committed) | Species pass rates auto-update when a real run sees more references than the stored calibration; token-average profiles are rebuilt with `HelperScripts/calibrate_soft_run_profile.py` |
 | In-memory caches | Per-process `lru_cache`s + dict caches around the SQLite DB | RAM only | No | Process exit |
 | OpenAI prompt cache | Server-side prefix cache (counted in `cached_input_tokens`) | OpenAI side, not local | Yes (OpenAI-managed) | Not user-controlled |
 
@@ -124,6 +125,18 @@ gets reused**, and **how to invalidate it**.
 - **Bootstrap**: missing files are downloaded from the pinned FlyBase release
   URLs by `_download_file()`.
 
+### FlyBase Chado XML and citation index
+
+- **Location**: `Data/FlyBase_Chado/` in the repo (gitignored): `chado_FBgn.xml.gz`,
+  `chado_FBgn.dtd`, and `synonym_evidence_<release>.tsv.gz`.
+- **Purpose**: `GetFBgnIDs.py` uses the index only to resolve a symbol shared by
+  several genes (counts distinct FlyBase publications per gene per symbol).
+  No network or LLM call at mapping time.
+- **Build**: `python HelperScripts/build_synonym_evidence.py` downloads the XML
+  (resumable) and streams it into the index; run it again to refresh for a new
+  release (change `FLYBASE_RELEASE` in that file). The older
+  `.flai_system/fbgn_collision_api_cache.json` is no longer used.
+
 ## 7. OpenAI pricing CSV
 
 - **Path**: `Data/openai_pricing.csv` (committed seed file).
@@ -139,12 +152,17 @@ gets reused**, and **how to invalidate it**.
 
 - **Path**: `.flai_system/soft_run_reference_profiles.json` (committed).
 - **Contents**:
-  - `profiles[]`: empirical token averages per `(summary_model,
-    classification_model)` pair (input/output per reference, per gene,
-    requests per reference, etc.).
+  - `profiles[]`: empirical token averages (input/output per reference, per
+    gene, requests per reference, etc.). A profile keyed on a
+    `(summary_model, classification_model)` pair is used when it matches the
+    configured models; otherwise the model-independent `"default": true`
+    profile is used and repriced at the current models' rates.
   - `species_keyword_pass_rates`: per-species `keyword_pass_rate` plus the
     sample size (`calibration_limited_references`,
     `calibration_metadata_keyword_matches`) and source CSV.
+- **Rebuilding profiles**: `HelperScripts/calibrate_soft_run_profile.py` pools
+  per-request usage from saved run stores (`--dry-run` to preview, `--default`
+  to force the model-independent profile). It leaves species pass rates alone.
 - **Update rule**: `_maybe_update_species_keyword_pass_rate` only overwrites a
   species entry if a real run observed at least as many limited references as
   the stored calibration.
